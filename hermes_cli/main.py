@@ -5480,6 +5480,15 @@ def _desktop_linux_sandbox_fixup(packaged_executable: Path) -> bool:
     return True
 
 
+def _desktop_launch_cwd(args: argparse.Namespace) -> str:
+    """Resolve the initial Desktop workspace cwd.
+
+    `hermes desktop` should behave like the CLI: launching it from a folder
+    makes that folder the initial workspace unless the user passes --cwd.
+    """
+    return str(Path(getattr(args, "cwd", None) or os.getcwd()).expanduser().resolve())
+
+
 def cmd_gui(args: argparse.Namespace):
     """Build and launch the native Electron desktop GUI."""
     desktop_dir = PROJECT_ROOT / "apps" / "desktop"
@@ -5503,8 +5512,7 @@ def cmd_gui(args: argparse.Namespace):
         env["HERMES_DESKTOP_IGNORE_EXISTING"] = "1"
     if getattr(args, "hermes_root", None):
         env["HERMES_DESKTOP_HERMES_ROOT"] = str(Path(args.hermes_root).expanduser().resolve())
-    if getattr(args, "cwd", None):
-        env["HERMES_DESKTOP_CWD"] = str(Path(args.cwd).expanduser().resolve())
+    env["HERMES_DESKTOP_CWD"] = _desktop_launch_cwd(args)
 
     source_mode = getattr(args, "source", False)
     skip_build = getattr(args, "skip_build", False)
