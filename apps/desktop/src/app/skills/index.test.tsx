@@ -7,6 +7,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 
 import type * as HermesApi from '@/hermes'
 import { queryClient } from '@/lib/query-client'
+import { $activeGatewayProfile } from '@/store/profile'
 
 const getSkills = vi.fn()
 const getToolsets = vi.fn()
@@ -85,6 +86,7 @@ beforeEach(() => {
 
 afterEach(() => {
   cleanup()
+  $activeGatewayProfile.set('default')
   vi.clearAllMocks()
   // Shared singleton client — drop cached skills/toolsets so each test refetches.
   queryClient.clear()
@@ -153,5 +155,16 @@ describe('SkillsView toolset management', () => {
     // Internal route change into the Models section with the aux slot target —
     // consumed by ModelSettings' deep-link highlight. Never an external URL.
     await waitFor(() => expect(navigateSpy).toHaveBeenCalledWith('/settings?tab=config:model&aux=vision'))
+  })
+
+  it('refreshes toolsets when the active gateway profile changes', async () => {
+    await renderSkills()
+
+    await screen.findByRole('switch', { name: 'Turn Web Search toolset off' })
+    expect(getToolsets).toHaveBeenCalledTimes(1)
+
+    $activeGatewayProfile.set('study')
+
+    await waitFor(() => expect(getToolsets).toHaveBeenCalledTimes(2))
   })
 })
