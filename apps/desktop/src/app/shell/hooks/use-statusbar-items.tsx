@@ -47,7 +47,7 @@ import {
 } from '@/store/updates'
 import type { StatusResponse, UsageStats } from '@/types/hermes'
 
-import { CRON_ROUTE, SETTINGS_ROUTE, WEBHOOKS_ROUTE } from '../../routes'
+import { CRON_ROUTE, SETTINGS_ROUTE, STUDY_ROUTE, WEBHOOKS_ROUTE } from '../../routes'
 import type { StatusbarItem } from '../statusbar-controls'
 
 const EMPTY_USAGE = { calls: 0, input: 0, output: 0, total: 0 } as const
@@ -487,6 +487,14 @@ export function useStatusbarItems({
         label: copy.webhooks,
         to: WEBHOOKS_ROUTE,
         toggleLabel: copy.webhooks,
+        variant: 'action'
+      },
+      {
+        icon: <Codicon name="book" size="0.75rem" />,
+        id: 'study',
+        label: 'StudyOS',
+        title: 'Open StudyOS',
+        to: STUDY_ROUTE,
         variant: 'action'
       }
     ],

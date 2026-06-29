@@ -104,7 +104,8 @@ import {
   MESSAGING_ROUTE,
   SIDEBAR_NAV_AREA,
   type SidebarNavContribution,
-  SKILLS_ROUTE
+  SKILLS_ROUTE,
+  STUDY_ROUTE
 } from '../../routes'
 import type { SidebarNavItem } from '../../types'
 
@@ -169,6 +170,12 @@ const SIDEBAR_NAV: SidebarNavItem[] = [
     icon: props => <Codicon name="files" {...props} />,
     route: ARTIFACTS_ROUTE,
     keybindActionId: 'nav.artifacts'
+  },
+  {
+    id: 'study',
+    label: '',
+    icon: props => <Codicon name="book" {...props} />,
+    route: STUDY_ROUTE
   }
 ]
 

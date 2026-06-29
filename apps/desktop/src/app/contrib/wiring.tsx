@@ -130,6 +130,7 @@ import type { WiringActions, WiringApi } from './types'
 const AgentsView = lazy(async () => ({ default: (await import('../agents')).AgentsView }))
 const CommandCenterView = lazy(async () => ({ default: (await import('../command-center')).CommandCenterView }))
 const CronView = lazy(async () => ({ default: (await import('../cron')).CronView }))
+const StudyView = lazy(async () => ({ default: (await import('../study')).StudyView }))
 const WebhooksView = lazy(async () => ({ default: (await import('../webhooks')).WebhooksView }))
 const ProfilesView = lazy(async () => ({ default: (await import('../profiles')).ProfilesView }))
 const SettingsView = lazy(async () => ({ default: (await import('../settings')).SettingsView }))
@@ -219,6 +220,7 @@ export function ContribWiring({ children }: { children: ReactNode }) {
     resetOverlayReturnRoute,
     settingsOpen,
     starmapOpen,
+    studyOpen,
     toggleCommandCenter,
     webhooksOpen
   } = useOverlayRouting()
@@ -1085,6 +1087,12 @@ export function ContribWiring({ children }: { children: ReactNode }) {
       {webhooksOpen && (
         <Suspense fallback={null}>
           <WebhooksView onClose={closeOverlayToPreviousRoute} />
+        </Suspense>
+      )}
+
+      {studyOpen && (
+        <Suspense fallback={null}>
+          <StudyView onClose={closeOverlayToPreviousRoute} />
         </Suspense>
       )}
 
