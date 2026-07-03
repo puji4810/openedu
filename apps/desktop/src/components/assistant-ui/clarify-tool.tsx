@@ -16,6 +16,7 @@ import {
 import { requestComposerFocus, requestComposerInsert } from '@/app/chat/composer/focus'
 import { useSessionView } from '@/app/chat/session-view'
 import { ToolFallback } from '@/components/assistant-ui/tool/fallback'
+import { CompactMarkdown } from '@/components/chat/compact-markdown'
 import { WIDGET_SHELL_CLASS } from '@/components/chat/widget-shell'
 import { Button } from '@/components/ui/button'
 import { Kbd } from '@/components/ui/kbd'
@@ -554,9 +555,7 @@ function ClarifyToolPending({ args }: ToolCallMessagePartProps) {
     >
       <ClarifyShell className="grid gap-2">
         <div className="flex items-start gap-2">
-          <span className="flex-1 whitespace-pre-wrap font-medium leading-(--conversation-line-height)">
-            {question}
-          </span>
+          <CompactMarkdown className="flex-1 font-medium" text={question} />
           <MessageQuestion aria-hidden className="mt-px size-4 shrink-0 text-(--ui-text-tertiary)" />
         </div>
 
