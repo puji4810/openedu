@@ -1092,7 +1092,13 @@ export function ContribWiring({ children }: { children: ReactNode }) {
 
       {studyOpen && (
         <Suspense fallback={null}>
-          <StudyView onClose={closeOverlayToPreviousRoute} />
+          <StudyView
+            onClose={closeOverlayToPreviousRoute}
+            onStartAgentReview={async prompt => {
+              closeOverlayToPreviousRoute()
+              await submitText(prompt)
+            }}
+          />
         </Suspense>
       )}
 
