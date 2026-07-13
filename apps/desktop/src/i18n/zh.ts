@@ -3033,6 +3033,7 @@ export const zh: Translations = {
     loading: '正在加载 StudyOS…',
     retry: '重试',
     examDate: '考试日期',
+    deadline: '截止日期',
     phase: '阶段',
     timezone: '时区',
     range: '范围',
