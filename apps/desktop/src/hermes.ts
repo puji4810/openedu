@@ -1416,24 +1416,26 @@ export function instantiateAutomationBlueprint(
   })
 }
 
+const STUDY_API_PREFIX = '/api/plugins/study_os'
+
 export function getStudyProjects(): Promise<StudyProjectsResponse> {
   return window.hermesDesktop.api<StudyProjectsResponse>({
     ...profileScoped(),
-    path: '/api/study/projects'
+    path: `${STUDY_API_PREFIX}/projects`
   })
 }
 
 export function getStudySettings(): Promise<StudySettings> {
   return window.hermesDesktop.api<StudySettings>({
     ...profileScoped(),
-    path: '/api/study/settings'
+    path: `${STUDY_API_PREFIX}/settings`
   })
 }
 
 export function updateStudySettings(vaultPath: string): Promise<StudySettings> {
   return window.hermesDesktop.api<StudySettings>({
     ...profileScoped(),
-    path: '/api/study/settings',
+    path: `${STUDY_API_PREFIX}/settings`,
     method: 'PUT',
     body: { vault_path: vaultPath }
   })
@@ -1445,7 +1447,7 @@ export function setStudyActiveProject(projectId: string): Promise<{
 }> {
   return window.hermesDesktop.api({
     ...profileScoped(),
-    path: `/api/study/projects/${encodeURIComponent(projectId)}/active`,
+    path: `${STUDY_API_PREFIX}/projects/${encodeURIComponent(projectId)}/active`,
     method: 'PUT'
   })
 }
@@ -1455,7 +1457,7 @@ export function getStudyOverview(projectId?: string): Promise<StudyOverviewRespo
 
   return window.hermesDesktop.api<StudyOverviewResponse>({
     ...profileScoped(),
-    path: `/api/study/overview${query}`
+    path: `${STUDY_API_PREFIX}/overview${query}`
   })
 }
 
@@ -1466,7 +1468,7 @@ export function decideStudyPlanProposal(
 ): Promise<StudyPlanProposalDecisionResponse> {
   return window.hermesDesktop.api<StudyPlanProposalDecisionResponse>({
     ...profileScoped(),
-    path: `/api/study/projects/${encodeURIComponent(projectId)}/plan-proposals/${encodeURIComponent(proposalId)}`,
+    path: `${STUDY_API_PREFIX}/projects/${encodeURIComponent(projectId)}/plan-proposals/${encodeURIComponent(proposalId)}`,
     method: 'PUT',
     body: { action }
   })
@@ -1475,21 +1477,21 @@ export function decideStudyPlanProposal(
 export function getStudyProject(projectId: string): Promise<StudyProject> {
   return window.hermesDesktop.api<StudyProject>({
     ...profileScoped(),
-    path: `/api/study/projects/${encodeURIComponent(projectId)}`
+    path: `${STUDY_API_PREFIX}/projects/${encodeURIComponent(projectId)}`
   })
 }
 
 export function getStudySchedules(projectId: string): Promise<StudySchedulesResponse> {
   return window.hermesDesktop.api<StudySchedulesResponse>({
     ...profileScoped(),
-    path: `/api/study/projects/${encodeURIComponent(projectId)}/schedules`
+    path: `${STUDY_API_PREFIX}/projects/${encodeURIComponent(projectId)}/schedules`
   })
 }
 
 export function getStudySchedule(projectId: string, scheduleId: string): Promise<StudySchedule> {
   return window.hermesDesktop.api<StudySchedule>({
     ...profileScoped(),
-    path: `/api/study/projects/${encodeURIComponent(projectId)}/schedules/${encodeURIComponent(scheduleId)}`
+    path: `${STUDY_API_PREFIX}/projects/${encodeURIComponent(projectId)}/schedules/${encodeURIComponent(scheduleId)}`
   })
 }
 
@@ -1516,14 +1518,14 @@ export function getStudyReviewDue(params?: {
 
   return window.hermesDesktop.api<StudyReviewDueResponse>({
     ...profileScoped(),
-    path: `/api/study/review/due${qs ? `?${qs}` : ''}`
+    path: `${STUDY_API_PREFIX}/review/due${qs ? `?${qs}` : ''}`
   })
 }
 
 export function getStudyReviewDetail(note: string): Promise<StudyReviewDetail> {
   return window.hermesDesktop.api<StudyReviewDetail>({
     ...profileScoped(),
-    path: '/api/study/review/detail',
+    path: `${STUDY_API_PREFIX}/review/detail`,
     method: 'POST',
     body: { note }
   })
@@ -1532,7 +1534,7 @@ export function getStudyReviewDetail(note: string): Promise<StudyReviewDetail> {
 export function submitStudyReviewAttempt(submission: StudyReviewSubmission): Promise<StudyReviewSubmissionResponse> {
   return window.hermesDesktop.api<StudyReviewSubmissionResponse>({
     ...profileScoped(),
-    path: '/api/study/review/attempt',
+    path: `${STUDY_API_PREFIX}/review/attempt`,
     method: 'POST',
     body: submission
   })
@@ -1541,7 +1543,7 @@ export function submitStudyReviewAttempt(submission: StudyReviewSubmission): Pro
 export function getStudyReviewStats(): Promise<StudyReviewStatsResponse> {
   return window.hermesDesktop.api<StudyReviewStatsResponse>({
     ...profileScoped(),
-    path: '/api/study/review/stats'
+    path: `${STUDY_API_PREFIX}/review/stats`
   })
 }
 
@@ -1560,28 +1562,28 @@ export function getStudyReviewQueue(params?: { state?: string; limit?: number })
 
   return window.hermesDesktop.api<StudyReviewQueueResponse>({
     ...profileScoped(),
-    path: `/api/study/review/queue${qs ? `?${qs}` : ''}`
+    path: `${STUDY_API_PREFIX}/review/queue${qs ? `?${qs}` : ''}`
   })
 }
 
 export function getStudyReviewConcepts(): Promise<StudyReviewConceptsResponse> {
   return window.hermesDesktop.api<StudyReviewConceptsResponse>({
     ...profileScoped(),
-    path: '/api/study/review/concepts'
+    path: `${STUDY_API_PREFIX}/review/concepts`
   })
 }
 
 export function getStudyProfile(): Promise<StudyProfile> {
   return window.hermesDesktop.api<StudyProfile>({
     ...profileScoped(),
-    path: '/api/study/profile'
+    path: `${STUDY_API_PREFIX}/profile`
   })
 }
 
 export function updateStudyProfile(profile: Partial<StudyProfile>): Promise<StudyProfile> {
   return window.hermesDesktop.api<StudyProfile>({
     ...profileScoped(),
-    path: '/api/study/profile',
+    path: `${STUDY_API_PREFIX}/profile`,
     method: 'PUT',
     body: profile
   })
