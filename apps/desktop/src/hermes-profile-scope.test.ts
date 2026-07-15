@@ -6,12 +6,14 @@ import {
   getElevenLabsVoices,
   getMemoryProviderConfig,
   getStatus,
+  getStudySettings,
   restartGateway,
   saveMemoryProviderConfig,
   setApiRequestProfile,
   speakText,
   transcribeAudio,
-  updateHermes
+  updateHermes,
+  updateStudySettings
 } from './hermes'
 
 // Contract: every backend-targeted action helper must carry the active gateway
@@ -79,5 +81,51 @@ describe('backend action helpers are profile-scoped', () => {
     for (const call of api.mock.calls) {
       expect(call[0].profile).toBe('jarvis')
     }
+  })
+})
+
+describe('StudyOS settings are profile-scoped', () => {
+  const vaults = new Map<string, string>()
+
+  const api = vi.fn(
+    async (req: { body?: { vault_path?: string }; method?: string; path: string; profile?: string }) => {
+      const profile = req.profile ?? 'default'
+
+      if (req.method === 'PUT' && req.body?.vault_path) {
+        vaults.set(profile, req.body.vault_path)
+      }
+
+      return {
+        configured: vaults.has(profile),
+        vault_path: vaults.get(profile) ?? null
+      } as never
+    }
+  )
+
+  beforeEach(() => {
+    ;(window as { hermesDesktop?: unknown }).hermesDesktop = { api }
+    vaults.clear()
+    api.mockClear()
+  })
+
+  afterEach(() => {
+    setApiRequestProfile(null)
+    delete (window as { hermesDesktop?: unknown }).hermesDesktop
+  })
+
+  it('keeps vault changes isolated when switching Hermes profiles', async () => {
+    setApiRequestProfile('study-a')
+    await updateStudySettings('/vaults/study-a')
+
+    setApiRequestProfile('study-b')
+    await updateStudySettings('/vaults/study-b')
+
+    setApiRequestProfile('study-a')
+    const studyA = await getStudySettings()
+    setApiRequestProfile('study-b')
+    const studyB = await getStudySettings()
+
+    expect(studyA.vault_path).toBe('/vaults/study-a')
+    expect(studyB.vault_path).toBe('/vaults/study-b')
   })
 })

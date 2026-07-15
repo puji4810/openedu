@@ -10,6 +10,10 @@ DEFAULT_CONFIG = {
     "fallback_providers": [],
     "credential_pool_strategies": {},
     "toolsets": ["hermes-cli"],
+    # StudyOS is profile-scoped and opt-in. The desktop setup flow writes the
+    # selected Obsidian vault here; OBSIDIAN_VAULT_PATH remains a compatibility
+    # fallback for existing users only.
+    "study_os": {"vault_path": ""},
     # SQLite journal mode used by every Hermes database opener. WAL is the
     # normal default; set DELETE for weak-fsync/shared filesystems where WAL is
     # not crash-safe (for example macOS virtiofs, NFS, or SMB).
