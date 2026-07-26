@@ -16,12 +16,18 @@ recall to `study-review`, teaching to `study-teach`, and diagnosis to
 
 ## Flow
 
-1. Read relevant records before changes; persist only completed outcomes:
+1. At the first StudyOS exchange of a day, call
+   `plan_proposal.ensure_today`. It derives and persists the day's plan once
+   and returns the existing one afterwards, so `created: false` means report
+   the plan already there — never build a second one by hand. Present it and
+   let the learner accept or reject; `plan_proposal.apply` then puts an
+   accepted plan on the calendar.
+2. Read relevant records before changes; persist only completed outcomes:
    LearningRecord for demonstrated progress, LearningDecisionRecord for
    accepted strategy.
-2. Start one focused Session, follow its ActivitySpec, and meet
+3. Start one focused Session, follow its ActivitySpec, and meet
    `evidence_requirements`.
-3. Never infer mastery from chat, counts, or plans.
+4. Never infer mastery from chat, counts, or plans.
    Never mutate system prompts; active Session state is turn-local context.
 <!-- prompt-context:end -->
 
