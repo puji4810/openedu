@@ -1,21 +1,13 @@
 import { Button } from '@/components/ui/button'
 import { useI18n } from '@/i18n'
-import type { StudyIntervention, StudyOverviewResponse } from '@/types/hermes'
+import type { StudyOverviewResponse } from '@/types/hermes'
+
+import { buildStudyInterventionCommand } from './agent-command'
 
 interface StudyTodayProps {
   onOpenReview: () => void
   onStartAgent?: (prompt: string) => void | Promise<void>
   overview: StudyOverviewResponse
-}
-
-function nextActionPrompt(action: StudyIntervention): string {
-  return [
-    'Use StudyOS to guide the following evidence-backed learning activity.',
-    `Objective: ${action.capability}`,
-    `Evidence target: ${action.evidence_dimension}`,
-    `Activity: ${action.kind}`,
-    `Keep assistance at ${action.recommended_activity.assistance_level} and record evaluator provenance.`
-  ].join('\n')
 }
 
 export function StudyToday({ onOpenReview, onStartAgent, overview }: StudyTodayProps) {
@@ -121,7 +113,13 @@ export function StudyToday({ onOpenReview, onStartAgent, overview }: StudyTodayP
                 {nextAction.priority_band}
               </div>
               {onStartAgent && (
-                <Button className="mt-4" onClick={() => void onStartAgent(nextActionPrompt(nextAction))} size="sm">
+                <Button
+                  className="mt-4"
+                  onClick={() =>
+                    void onStartAgent(buildStudyInterventionCommand(overview.project.project_id, nextAction))
+                  }
+                  size="sm"
+                >
                   {t.study.startWithAgent}
                 </Button>
               )}

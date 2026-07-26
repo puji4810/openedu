@@ -30,6 +30,17 @@ _LEARNING_STATES = ("未开始", "学习中", "已理解", "已掌握")
 _GRAPH_CACHE_TTL_HOURS = 1
 
 
+def automatic_review_level(current_level: int, result: str) -> int:
+    """Derive the semantic review level from the observed review result."""
+    if result == "incorrect":
+        return 1
+    if result == "partial":
+        return 2
+    if result == "correct":
+        return min(5, max(3, current_level + 1))
+    raise ValueError(f"Unsupported review result: {result}")
+
+
 def _parse_date(value: Any, default: date | None = None) -> date:
     if not value:
         return default or date.today()

@@ -222,8 +222,9 @@ def _iter_markdown_notes(
         if not path.is_file() or path.suffix.lower() != ".md":
             continue
         relative = path.resolve().relative_to(vault).as_posix()
-        if not include_study_os and (
-            relative == ".StudyOS" or relative.startswith(".StudyOS/")
+        parts = Path(relative).parts
+        if any(part.startswith(".") for part in parts) and not (
+            include_study_os and parts[0] == ".StudyOS"
         ):
             continue
         result.append(path.resolve())
@@ -316,6 +317,372 @@ def _find_note(
     return None, matches
 
 
+def _note_path(vault: Path, value: Any) -> tuple[Path, str]:
+    raw = str(value or "").strip()
+    if not raw:
+        raise ValueError("note path is required")
+    path = _safe_relative_path(vault, raw)
+    if not path.suffix:
+        path = path.with_suffix(".md")
+    if path.suffix.casefold() != ".md":
+        raise ValueError(f"StudyOS notes must use the .md extension: {raw}")
+    relative = path.relative_to(vault).as_posix()
+    if any(part.startswith(".") for part in Path(relative).parts):
+        raise ValueError(f"StudyOS notes cannot be saved in hidden directories: {raw}")
+    return path, relative
+
+
+def _note_record_from_raw(vault: Path, path: Path, raw: str) -> dict[str, Any]:
+    frontmatter, body, warning = _parse_frontmatter(raw)
+    headings = _extract_headings(body)
+    title = str(
+        frontmatter.get("title")
+        or (headings[0]["text"] if headings else path.stem)
+    ).strip()
+    return {
+        "path": path.relative_to(vault).as_posix(),
+        "title": title or path.stem,
+        "aliases": _as_list(frontmatter.get("aliases")),
+        "wikilinks": _extract_wikilinks(body),
+        "warning": warning,
+    }
+
+
+def _link_key(value: Any) -> str:
+    target = _strip_wikilink(str(value or "")).replace("\\", "/").strip()
+    while target.startswith("./"):
+        target = target[2:]
+    if target.casefold().endswith(".md"):
+        target = target[:-3]
+    return target.casefold()
+
+
+def _record_keys(record: dict[str, Any]) -> set[str]:
+    relative = str(record["path"])
+    path = Path(relative)
+    keys = {
+        _link_key(relative),
+        _link_key(path.with_suffix("").as_posix()),
+        _link_key(path.name),
+        _link_key(path.stem),
+        _link_key(record.get("title")),
+    }
+    keys.update(_link_key(alias) for alias in record.get("aliases", []))
+    return {key for key in keys if key}
+
+
+def _iter_linkable_assets(vault: Path) -> Iterable[Path]:
+    for path in vault.rglob("*"):
+        if not path.is_file() or path.suffix.casefold() == ".md":
+            continue
+        try:
+            relative = path.resolve().relative_to(vault)
+        except ValueError:
+            continue
+        if any(part.startswith(".") for part in relative.parts):
+            continue
+        yield path.resolve()
+
+
+def _prepare_note_drafts(
+    vault: Path,
+    notes: Any,
+    *,
+    overwrite: bool = False,
+) -> list[dict[str, Any]]:
+    if not isinstance(notes, list) or not notes:
+        raise ValueError("notes must be a non-empty array")
+    drafts: list[dict[str, Any]] = []
+    seen: set[str] = set()
+    for index, item in enumerate(notes):
+        if not isinstance(item, dict):
+            raise ValueError(f"notes[{index}] must be an object")
+        path, relative = _note_path(vault, item.get("path"))
+        if relative.casefold() in seen:
+            raise ValueError(f"Duplicate note path in batch: {relative}")
+        seen.add(relative.casefold())
+        content = item.get("content")
+        if not isinstance(content, str) or not content.strip():
+            raise ValueError(f"notes[{index}].content must be a non-empty string")
+        may_overwrite = bool(item.get("overwrite", overwrite))
+        if path.exists() and not may_overwrite:
+            raise FileExistsError(
+                f"Note already exists: {relative}; set overwrite=true to update it"
+            )
+        record = _note_record_from_raw(vault, path, content)
+        drafts.append(
+            {
+                "path": path,
+                "relative": relative,
+                "content": content,
+                "overwrite": may_overwrite,
+                "record": record,
+            }
+        )
+    return drafts
+
+
+def build_wikilink_graph(
+    vault: Path,
+    *,
+    drafts: list[dict[str, Any]] | None = None,
+    roots: Iterable[str] | None = None,
+) -> dict[str, Any]:
+    """Build the reachable Obsidian WikiLink graph and report dangling edges.
+
+    Drafts shadow notes at the same path. When drafts are supplied they are the
+    default roots, so an unrelated pre-existing dangling link elsewhere in a
+    Vault cannot block a focused save. Traversal still follows links through
+    existing notes, catching transitive breakage reachable from the new notes.
+    """
+
+    vault = vault.resolve()
+    drafts = drafts or []
+    draft_records = {
+        str(item["relative"]): dict(item["record"])
+        for item in drafts
+    }
+    objects: dict[str, dict[str, Any]] = {}
+    catalog = StudyNoteCatalog(vault)
+    for path in catalog.iter():
+        relative = path.relative_to(vault).as_posix()
+        if relative in draft_records:
+            continue
+        note, warnings = catalog.parse(path)
+        objects[relative] = {
+            "kind": "note",
+            "path": relative,
+            "title": note["title"],
+            "aliases": note.get("aliases", []),
+            "wikilinks": note.get("wikilinks", []),
+            "warnings": warnings,
+        }
+    for relative, record in draft_records.items():
+        objects[relative] = {
+            "kind": "note",
+            **record,
+            "warnings": [record["warning"]] if record.get("warning") else [],
+        }
+    for asset in _iter_linkable_assets(vault):
+        relative = asset.relative_to(vault).as_posix()
+        objects.setdefault(
+            relative,
+            {
+                "kind": "asset",
+                "path": relative,
+                "title": asset.name,
+                "aliases": [],
+                "wikilinks": [],
+                "warnings": [],
+            },
+        )
+
+    target_index: dict[str, set[str]] = {}
+    for object_id, record in objects.items():
+        if record["kind"] == "note":
+            keys = _record_keys(record)
+        else:
+            keys = {
+                str(record["path"]).casefold(),
+                Path(str(record["path"])).name.casefold(),
+            }
+        for key in keys:
+            target_index.setdefault(key, set()).add(object_id)
+
+    def resolve(source: str, target: str) -> list[str]:
+        keys = [_link_key(target)]
+        source_parent = Path(source).parent
+        if source_parent != Path("."):
+            keys.append(_link_key((source_parent / _strip_wikilink(target)).as_posix()))
+        matches: set[str] = set()
+        for key in keys:
+            matches.update(target_index.get(key, set()))
+        return sorted(matches)
+
+    if roots is None:
+        root_ids = (
+            [str(item["relative"]) for item in drafts]
+            if drafts
+            else sorted(
+                object_id
+                for object_id, record in objects.items()
+                if record["kind"] == "note"
+            )
+        )
+    else:
+        root_ids = []
+        for root in roots:
+            matches = resolve("", str(root))
+            root_ids.extend(
+                match for match in matches if objects[match]["kind"] == "note"
+            )
+
+    queue = list(dict.fromkeys(root_ids))
+    visited: set[str] = set()
+    edges: list[dict[str, Any]] = []
+    missing: list[dict[str, str]] = []
+    ambiguous: list[dict[str, Any]] = []
+    warnings: list[str] = []
+    while queue:
+        source = queue.pop(0)
+        if source in visited or source not in objects:
+            continue
+        record = objects[source]
+        if record["kind"] != "note":
+            continue
+        visited.add(source)
+        warnings.extend(
+            f"{source}: {warning}"
+            for warning in record.get("warnings", [])
+            if warning
+        )
+        for target in record.get("wikilinks", []):
+            resolved = resolve(source, target)
+            if not resolved:
+                missing.append({"source": source, "target": target})
+                continue
+            edge = {"source": source, "target": target, "resolved": resolved}
+            edges.append(edge)
+            if len(resolved) > 1:
+                ambiguous.append(edge)
+            for destination in resolved:
+                if objects[destination]["kind"] == "note" and destination not in visited:
+                    queue.append(destination)
+
+    missing = sorted(
+        {
+            (item["source"], item["target"]): item
+            for item in missing
+        }.values(),
+        key=lambda item: (item["source"].casefold(), item["target"].casefold()),
+    )
+    edges.sort(key=lambda item: (item["source"].casefold(), item["target"].casefold()))
+    ambiguous.sort(
+        key=lambda item: (item["source"].casefold(), item["target"].casefold())
+    )
+    return {
+        "root_notes": list(dict.fromkeys(root_ids)),
+        "visited_notes": sorted(visited),
+        "node_count": len(visited),
+        "edge_count": len(edges),
+        "edges": edges,
+        "missing": missing,
+        "broken_links": missing,
+        "ambiguous_links": ambiguous,
+        "warnings": sorted(set(warnings)),
+    }
+
+
+def _validate_note_batch(
+    vault: Path,
+    notes: Any,
+    *,
+    overwrite: bool = False,
+) -> tuple[dict[str, Any], list[dict[str, Any]]]:
+    drafts = _prepare_note_drafts(vault.resolve(), notes, overwrite=overwrite)
+    graph = build_wikilink_graph(vault.resolve(), drafts=drafts)
+    return {
+        "notes": [
+            {
+                "path": item["relative"],
+                "exists": item["path"].exists(),
+                "wikilinks": item["record"]["wikilinks"],
+            }
+            for item in drafts
+        ],
+        "graph": graph,
+        "missing": graph["missing"],
+    }, drafts
+
+
+def validate_note_batch(
+    vault: Path,
+    notes: Any,
+    *,
+    overwrite: bool = False,
+) -> dict[str, Any]:
+    """Validate a note batch without exposing internal filesystem objects."""
+
+    validation, _drafts = _validate_note_batch(
+        vault,
+        notes,
+        overwrite=overwrite,
+    )
+    return validation
+
+
+def _remove_empty_parents(path: Path, vault: Path) -> None:
+    parent = path.parent
+    while parent != vault:
+        try:
+            parent.rmdir()
+        except OSError:
+            break
+        parent = parent.parent
+
+
+def save_note_batch(
+    vault: Path,
+    notes: Any,
+    *,
+    overwrite: bool = False,
+) -> dict[str, Any]:
+    """Validate and atomically save a recursively closed batch of notes."""
+
+    vault = vault.resolve()
+    validation, drafts = _validate_note_batch(
+        vault,
+        notes,
+        overwrite=overwrite,
+    )
+    if validation["missing"]:
+        return {
+            "saved": False,
+            "notes": validation["notes"],
+            "graph": validation["graph"],
+            "missing": validation["missing"],
+        }
+
+    backups = {
+        item["relative"]: (
+            item["path"].exists(),
+            _read_text(item["path"]) if item["path"].exists() else None,
+        )
+        for item in drafts
+    }
+    written: list[dict[str, Any]] = []
+    try:
+        for item in drafts:
+            written.append(item)
+            _write_text(item["path"], item["content"])
+    except Exception:
+        for item in reversed(written):
+            existed, content = backups[item["relative"]]
+            if existed and content is not None:
+                _write_text(item["path"], content)
+            else:
+                item["path"].unlink(missing_ok=True)
+                _remove_empty_parents(item["path"], vault)
+        raise
+
+    graph_cache = vault / ".StudyOS" / "concept_graph.json"
+    graph_cache.unlink(missing_ok=True)
+    return {
+        "saved": True,
+        "notes": [
+            {
+                "path": item["relative"],
+                "created": not backups[item["relative"]][0],
+                "updated": backups[item["relative"]][0],
+                "wikilinks": item["record"]["wikilinks"],
+            }
+            for item in drafts
+        ],
+        "graph": validation["graph"],
+        "missing": [],
+    }
+
+
 @dataclass(frozen=True)
 class StudyNoteCatalog:
     """Parse, discover, and resolve notes inside one Vault."""
@@ -354,6 +721,37 @@ class StudyNoteCatalog:
             self.vault,
             note_ref,
             include_study_os=include_study_os,
+        )
+
+    def wikilink_graph(
+        self,
+        *,
+        roots: Iterable[str] | None = None,
+    ) -> dict[str, Any]:
+        return build_wikilink_graph(self.vault, roots=roots)
+
+    def validate_batch(
+        self,
+        notes: Any,
+        *,
+        overwrite: bool = False,
+    ) -> dict[str, Any]:
+        return validate_note_batch(
+            self.vault,
+            notes,
+            overwrite=overwrite,
+        )
+
+    def save_batch(
+        self,
+        notes: Any,
+        *,
+        overwrite: bool = False,
+    ) -> dict[str, Any]:
+        return save_note_batch(
+            self.vault,
+            notes,
+            overwrite=overwrite,
         )
 
     @staticmethod

@@ -120,11 +120,10 @@ describe('ReviewView', () => {
     expect(screen.queryByText('先判断参数符号。')).toBeNull()
 
     fireEvent.change(screen.getByLabelText('Your answer'), { target: { value: '先求导，再讨论参数符号。' } })
-    fireEvent.click(screen.getByRole('button', { name: 'Confidence 4' }))
     fireEvent.click(screen.getByRole('button', { name: 'Reveal answer' }))
 
     expect(await screen.findByText('先判断参数符号。')).toBeTruthy()
-    fireEvent.click(screen.getByRole('button', { name: 'Correct' }))
+    fireEvent.click(screen.getByRole('button', { name: 'I got it right' }))
 
     await waitFor(() => {
       expect(submitStudyReviewAttempt).toHaveBeenCalledWith(
@@ -133,7 +132,6 @@ describe('ReviewView', () => {
           note: reviewItem.path,
           response: '先求导，再讨论参数符号。',
           result: 'correct',
-          self_confidence: 4,
           evaluator: { kind: 'self', id: 'desktop-review' },
           assistance: { level: 'independent', hints_used: 0 }
         })

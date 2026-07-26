@@ -2518,7 +2518,6 @@ export interface Translations {
     backToList: string
     yourAnswer: string
     answerPlaceholder: string
-    confidence: string
     revealAnswer: string
     referenceAnswer: string
     noReferenceAnswer: string

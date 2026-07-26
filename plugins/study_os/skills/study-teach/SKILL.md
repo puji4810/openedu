@@ -20,9 +20,11 @@ source notes, and never mutate system prompts.
 3. Ask for retrieval or a small application before feedback. Vary one thing at
    a time when checking transfer; do not reveal the answer before a genuine
    attempt.
-4. Record the response with `study_activity(resource="attempt", action="record")`
-   including result, confidence, concepts, transfer level, and a specific
-   diagnosis. Use `diagnoses:[]` when none is supported; otherwise each item is
+4. Record only after the learner responds. For an active Session, use
+   `study_coach.advance` with evaluator and assistance provenance so the Session
+   advances; otherwise use `study_activity(resource="attempt", action="record")`.
+   Include result, concepts, transfer level, evaluator provenance, and a
+   specific diagnosis. Use `diagnoses:[]` when none is supported; otherwise each item is
    an object with non-empty `kind` and observed `evidence`, never a string.
    Create a `learning_record` only for demonstrated, durable progress and
    include the concrete evidence and source links.

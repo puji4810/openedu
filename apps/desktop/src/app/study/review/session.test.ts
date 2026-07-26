@@ -10,7 +10,6 @@ import {
   answerReview,
   cancelReviewSession,
   revealReviewAnswer,
-  setReviewConfidence,
   startReviewSession,
   submitReviewResult,
   tickReviewSession
@@ -70,7 +69,6 @@ describe('review session state machine', () => {
     expect($reviewSession.get().status).toBe('answering')
 
     answerReview('Differentiate first.')
-    setReviewConfidence(4)
     const startedAt = $reviewSession.get().startedAt
     tickReviewSession((startedAt ?? 0) + 3000)
     revealReviewAnswer()
@@ -90,8 +88,9 @@ describe('review session state machine', () => {
     expect(adapter.submissions[0]).toMatchObject({
       duration_seconds: 3,
       note: item.path,
-      response: 'Differentiate first.',
-      self_confidence: 4
+      response: 'Differentiate first.'
     })
+    expect(adapter.submissions[0]).not.toHaveProperty('new_review_level')
+    expect(adapter.submissions[0]).not.toHaveProperty('self_confidence')
   })
 })

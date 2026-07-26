@@ -121,7 +121,17 @@ def test_due_reviews_supports_explicit_and_composable_review_selectors(vault: Pa
 
     assert result["ok"] is True
     assert [item["path"] for item in result["data"]["due"]] == ["Math/examples/limit.md"]
-    assert result["data"]["selection"] == {"review_state": "all", "sort": "title", "match": "all"}
+    assert result["data"]["selection"] == {
+        "review_state": "all",
+        "sort": "title",
+        "match": "all",
+        "limit": 30,
+        "notes": ["math/examples/limit.md"],
+        "tags": ["calculus", "math"],
+        "concepts": ["taylor"],
+        "difficulties": ["hard"],
+        "min_review_level": 3,
+    }
 
 
 def test_due_reviews_default_scope_remains_due_only(vault: Path):
@@ -138,6 +148,91 @@ def test_due_reviews_default_scope_remains_due_only(vault: Path):
 
     assert "OS/examples/future.md" not in {item["path"] for item in default_result["data"]["due"]}
     assert "OS/examples/future.md" in {item["path"] for item in all_result["data"]["due"]}
+
+
+def test_due_reviews_excludes_hidden_tool_directories(vault: Path):
+    from plugins.study_os.tools import handle_study_due_reviews
+
+    accidental = vault / ".opencode" / "skills" / "plugin" / "examples" / "README.md"
+    accidental.parent.mkdir(parents=True)
+    accidental.write_text("# Tool documentation\n", encoding="utf-8")
+
+    result = _loads(
+        handle_study_due_reviews(
+            {"vault_path": str(vault), "review_state": "all", "limit": 500}
+        )
+    )
+
+    assert result["ok"] is True
+    assert not any(item["path"].startswith(".opencode/") for item in result["data"]["due"])
+
+
+def test_due_reviews_filters_yaml_tags_limits_and_excluded_paths(vault: Path):
+    from plugins.study_os.tools import handle_study_due_reviews
+
+    examples = {
+        "Archive/examples/old.md": ("A archived", ["math", "calculus"]),
+        "Math/examples/keep-a.md": ("B keep", ["math", "calculus"]),
+        "Math/examples/keep-b.md": ("C keep", ["calculus"]),
+        "Math/examples/other.md": ("D other", ["linear-algebra"]),
+    }
+    for relative, (title, tags) in examples.items():
+        path = vault / relative
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(
+            "---\n"
+            "type: example\n"
+            f"title: {title}\n"
+            f"tags: [{', '.join(tags)}]\n"
+            "review_level: 0\n"
+            "---\n# Review item\n",
+            encoding="utf-8",
+        )
+
+    result = _loads(
+        handle_study_due_reviews(
+            {
+                "vault_path": str(vault),
+                "tags": ["calculus"],
+                "exclude_paths": ["Archive"],
+                "review_state": "all",
+                "sort": "title",
+                "limit": 1,
+            }
+        )
+    )
+
+    assert result["ok"] is True
+    assert result["data"]["count"] == 1
+    assert result["data"]["available_count"] == 2
+    assert [item["path"] for item in result["data"]["due"]] == ["Math/examples/keep-a.md"]
+    assert result["data"]["selection"] == {
+        "review_state": "all",
+        "sort": "title",
+        "match": "any",
+        "tags": ["calculus"],
+        "exclude_paths": ["archive"],
+        "limit": 1,
+    }
+
+    shortfall = _loads(
+        handle_study_due_reviews(
+            {
+                "vault_path": str(vault),
+                "tags": ["calculus"],
+                "exclude_paths": ["Archive"],
+                "review_state": "all",
+                "sort": "title",
+                "limit": 3,
+            }
+        )
+    )
+    assert shortfall["data"]["count"] == 2
+    assert shortfall["data"]["available_count"] == 2
+    assert [item["path"] for item in shortfall["data"]["due"]] == [
+        "Math/examples/keep-a.md",
+        "Math/examples/keep-b.md",
+    ]
 
 
 def test_review_submit_records_one_atomic_attempt_and_spacing_update(vault: Path):
@@ -157,7 +252,6 @@ def test_review_submit_records_one_atomic_attempt_and_spacing_update(vault: Path
                     "response": "高级调度决定作业接纳，低级调度负责进程切换。",
                     "result": "correct",
                     "duration_seconds": 30,
-                    "self_confidence": 4,
                 },
             }
         )
@@ -1034,6 +1128,47 @@ def test_study_prompt_context_truncates_project_summary(vault: Path):
     assert fragments["project_summary"]["char_count"] == 1200
 
 
+def test_study_prompt_context_truncates_project_summary_to_total_budget(vault: Path):
+    from plugins.study_os.tools import handle_study_project, handle_study_prompt_context
+
+    initialized = _loads(
+        handle_study_project(
+            {
+                "vault_path": str(vault),
+                "action": "init",
+                "project_id": "kaoyan-2027",
+                "domain_pack": "kaoyan.v1",
+            }
+        )
+    )
+    summary_path = vault / ".StudyOS" / "projects" / "kaoyan-2027" / "prompt_summary.md"
+    summary_path.write_text("z" * 1200, encoding="utf-8")
+
+    context = _loads(
+        handle_study_prompt_context(
+            {
+                "vault_path": str(vault),
+                "intent": "reviewing",
+                "project_id": "kaoyan-2027",
+            }
+        )
+    )
+
+    assert initialized["ok"] is True
+    assert context["ok"] is True
+    fragments = {fragment["kind"]: fragment for fragment in context["data"]["fragments"]}
+    fixed_char_count = sum(
+        fragment["char_count"]
+        for kind, fragment in fragments.items()
+        if kind != "project_summary"
+    )
+    remaining = 6000 - fixed_char_count
+    assert 0 < remaining < 1200
+    assert context["data"]["total_char_count"] == 6000
+    assert fragments["project_summary"]["char_count"] == remaining
+    assert context["warnings"] == [f"project_summary truncated to {remaining} characters"]
+
+
 def test_study_activity_loads_all_workflow_contexts_within_budget(vault: Path):
     from plugins.study_os.learning import handle_study_activity
 
@@ -1145,7 +1280,7 @@ def test_study_os_skill_descriptions_and_budgets(monkeypatch):
         study_os.register(ctx)
         expected = {
             "study-os": ("Route StudyOS learning workflows.", 6000),
-            "study-plan": ("Plan StudyOS projects, interventions, and schedules.", 9000),
+            "study-plan": ("Create, revise, and persist StudyOS learning schedules.", 9000),
             "study-organize": ("Organize problems into StudyOS notes.", 9000),
             "study-review": ("Run StudyOS spaced repetition reviews.", 9000),
             "study-teach": ("Teach through StudyOS learning records.", 9000),
@@ -1172,11 +1307,55 @@ def test_study_os_skill_descriptions_and_budgets(monkeypatch):
                 assert "Long-term roadmaps belong in `phases`" in body
                 assert "`events` may be empty" in body
                 assert "effort_minutes" in body
+                assert ".StudyOS/plans/" in body
+                assert "Continue in the same turn" in body
+                assert "study_activity` is" in body
         for term in ("艾宾浩斯", "整理", "错题", "weekly", "curriculum", "考研", "engineering", "research", "LearningDecisionRecord", "LearningRecord", "VisualLesson"):
             assert term in all_text
     finally:
         for name in ("study_activity", "study_coach"):
             registry.deregister(name)
+
+
+def test_study_os_skills_document_the_model_lifecycle_contract():
+    from plugins.study_os.learning import STUDY_COACH_SCHEMA
+
+    skills_root = Path("plugins/study_os/skills")
+    router = (skills_root / "study-os" / "SKILL.md").read_text(encoding="utf-8")
+    teaching = (skills_root / "study-teach" / "SKILL.md").read_text(encoding="utf-8")
+    required_contract_fields = STUDY_COACH_SCHEMA["parameters"]["properties"]["data"]["properties"][
+        "contract"
+    ]["required"]
+
+    assert "study_coach(action=\"start\"" in router
+    assert "study_coach(action=\"advance\"" in router
+    for field in required_contract_fields:
+        assert field in router
+    assert "study_coach.advance" in teaching
+    assert "active Session" in teaching
+
+
+def test_study_review_skill_documents_bounded_yaml_tag_selection():
+    review = Path("plugins/study_os/skills/study-review/SKILL.md").read_text(encoding="utf-8")
+
+    for term in ("YAML tag", "limit", "exclude_paths", "available_count"):
+        assert term in review
+    assert "never broaden" in review.casefold()
+    assert len(review) <= 2500
+
+
+def test_study_review_skill_documents_automatic_review_levels():
+    from plugins.study_os.learning import STUDY_ACTIVITY_SCHEMA
+
+    review = Path("plugins/study_os/skills/study-review/SKILL.md").read_text(encoding="utf-8")
+    properties = STUDY_ACTIVITY_SCHEMA["parameters"]["properties"]["data"]["properties"]
+
+    assert "self_confidence" not in properties
+    assert "new_review_level" not in properties
+    assert "Do not ask for confidence or a review level" in review
+    assert "incorrect → Lv.1" in review
+    assert "partial → Lv.2" in review
+    assert "correct → at least Lv.3" in review
 
 
 def test_study_toolset_is_opt_in():
@@ -1211,6 +1390,86 @@ def test_study_tool_schemas_expose_the_runtime_diagnosis_contract():
         assert diagnoses["items"]["properties"]["evidence"]["minLength"] == 1
 
     assert "Long-term date ranges belong in phases" in STUDY_ACTIVITY_SCHEMA["description"]
+
+
+def test_study_activity_schema_exposes_review_queue_selectors():
+    from plugins.study_os.learning import STUDY_ACTIVITY_SCHEMA
+    from plugins.study_os.tools import STUDY_DUE_REVIEWS_SCHEMA
+
+    activity_data = STUDY_ACTIVITY_SCHEMA["parameters"]["properties"]["data"]["properties"]
+    review_parameters = STUDY_DUE_REVIEWS_SCHEMA["parameters"]["properties"]
+    expected = {
+        name: schema
+        for name, schema in review_parameters.items()
+        if name not in {"vault_path", "notes"}
+    }
+
+    assert {name: activity_data[name] for name in expected} == expected
+    note_variants = activity_data["notes"]["items"]["oneOf"]
+    assert review_parameters["notes"]["items"] in note_variants
+
+
+def test_study_activity_schema_and_skills_require_closed_wikilink_saves():
+    from plugins.study_os.learning import STUDY_ACTIVITY_SCHEMA
+
+    description = STUDY_ACTIVITY_SCHEMA["description"]
+    actions = STUDY_ACTIVITY_SCHEMA["parameters"]["properties"]["action"][
+        "description"
+    ]
+    note_items = STUDY_ACTIVITY_SCHEMA["parameters"]["properties"]["data"][
+        "properties"
+    ]["notes"]["items"]["oneOf"]
+    router = Path("plugins/study_os/skills/study-os/SKILL.md").read_text(
+        encoding="utf-8"
+    )
+    organize = Path(
+        "plugins/study_os/skills/study-organize/SKILL.md"
+    ).read_text(encoding="utf-8")
+
+    assert "note.validate then note.save" in description
+    assert "note.list/read/extract/audit/graph/validate/save" in actions
+    assert any(
+        variant.get("required") == ["path", "content"] for variant in note_items
+    )
+    assert "never use generic writes" in router.casefold()
+    assert "Never use a generic file-writing tool" in organize
+
+
+def test_study_coach_schema_exposes_lifecycle_requirements_before_dispatch():
+    jsonschema = pytest.importorskip("jsonschema")
+
+    from plugins.study_os.contract_models import EVIDENCE_DIMENSIONS, SCHEDULE_ID_PATTERN
+    from plugins.study_os.learning import STUDY_COACH_SCHEMA
+    from plugins.study_os.schemas import ASSISTANCE_LEVELS, EVALUATOR_KINDS, LEARNING_MODES
+
+    data_properties = STUDY_COACH_SCHEMA["parameters"]["properties"]["data"]["properties"]
+    contract_schema = data_properties["contract"]
+    contract_properties = contract_schema["properties"]
+    observation_schema = data_properties["observation"]
+
+    assert data_properties["session_id"]["pattern"] == SCHEDULE_ID_PATTERN
+    assert set(contract_schema["required"]) == {
+        "mode",
+        "objective",
+        "time_budget_minutes",
+        "assistance_level",
+        "evidence_targets",
+    }
+    assert set(contract_properties["mode"]["enum"]) == LEARNING_MODES
+    assert set(contract_properties["assistance_level"]["enum"]) == ASSISTANCE_LEVELS
+    assert set(contract_properties["evidence_targets"]["items"]["enum"]) == set(EVIDENCE_DIMENSIONS)
+    assert contract_properties["time_budget_minutes"]["minimum"] == 1
+    assert contract_properties["time_budget_minutes"]["maximum"] == 720
+    assert set(observation_schema["required"]) == {"response", "result", "evaluator"}
+    assert set(observation_schema["properties"]["evaluator"]["properties"]["kind"]["enum"]) == EVALUATOR_KINDS
+
+    observed_bad_contract = {
+        "objective": "Translate distance conditions into surface equations.",
+        "activity_type": "teach-test",
+    }
+    errors = list(jsonschema.Draft7Validator(contract_schema).iter_errors(observed_bad_contract))
+
+    assert len([error for error in errors if error.validator == "required"]) == 4
 
 
 def test_study_activity_diagnosis_error_explains_how_to_retry(vault: Path):
@@ -1299,7 +1558,6 @@ def test_study_activity_records_and_queries_immutable_attempts(vault: Path):
                     "response": "Divided by an expression without checking its sign.",
                     "result": "incorrect",
                     "score": 0.2,
-                    "self_confidence": 5,
                     "transfer_level": "execution",
                     "concepts": ["函数单调性"],
                     "patterns": ["含参导数符号判断"],
@@ -1400,7 +1658,7 @@ def test_study_coach_uses_evidence_for_summary_recommendation_and_pattern_propos
         )
     )
     assert init["ok"] is True
-    for index, confidence in enumerate((4, 5), start=1):
+    for index in range(1, 3):
         result = _loads(
             handle_study_activity(
                 {
@@ -1415,7 +1673,6 @@ def test_study_coach_uses_evidence_for_summary_recommendation_and_pattern_propos
                         "response": "Applied the routine before checking the condition.",
                         "result": "incorrect",
                         "score": 0.0,
-                        "self_confidence": confidence,
                         "transfer_level": "execution",
                         "concepts": ["函数单调性"],
                         "patterns": ["含参导数符号判断"],
@@ -1459,7 +1716,7 @@ def test_study_coach_uses_evidence_for_summary_recommendation_and_pattern_propos
     assert summary["data"]["summary"]["attempt_count"] == 2
     assert recommendation["data"]["diagnosis"]["evidence_dimensions"]["execution"]["attempt_count"] == 2
     interventions = {item["intervention"] for item in recommendation["data"]["recommendations"]}
-    assert {"misconception_probe", "calibration_check", "near_transfer_probe"} <= interventions
+    assert {"misconception_probe", "near_transfer_probe"} <= interventions
     proposal = proposed["data"]["proposals"][0]
     assert proposal["status"] == "candidate"
     assert proposal["evidence_attempt_ids"] == ["att-condition-001", "att-condition-002"]
@@ -1549,7 +1806,6 @@ def test_learning_runtime_runs_one_evidence_backed_session(vault: Path):
                         "result": "partial",
                         "score": 0.5,
                         "duration_seconds": 480,
-                        "self_confidence": 3,
                         "concepts": ["routing"],
                         "artifact_refs": ["command:python reproduce_routing.py", "result:routing-run-001.json"],
                         "diagnoses": [
@@ -1962,6 +2218,116 @@ def test_active_learning_context_is_turn_local_bounded_and_removed_on_finish(vau
     assert active_learning_context(session_id="hermes-learning-context-001") is None
 
 
+def test_study_planning_context_requires_canonical_tool_persistence(
+    vault: Path,
+    monkeypatch,
+):
+    from plugins.study_os.context import study_planning_context
+    from plugins.study_os.learning import handle_study_activity
+
+    monkeypatch.setenv("OBSIDIAN_VAULT_PATH", str(vault))
+    initialized = _loads(
+        handle_study_activity(
+            {
+                "resource": "project",
+                "action": "init",
+                "vault_path": str(vault),
+                "data": {"project_id": "kaoyan-2027", "domain_pack": "kaoyan.v1"},
+            }
+        )
+    )
+
+    context = study_planning_context(
+        user_message="请完成线性代数学习规划，并登记到 StudyOS 日历。"
+    )
+
+    assert initialized["ok"] is True
+    assert context is not None
+    prompt = context["context"]
+    for required in (
+        "project.status",
+        "prompt_context.load",
+        "schedule.validate",
+        "schedule.save",
+        "Markdown",
+        "future tool call",
+    ):
+        assert required in prompt
+    assert study_planning_context(user_message="帮我规划一次普通旅行。") is None
+    assert study_planning_context(user_message="Explain this study result.") is None
+
+
+def test_study_os_startup_injects_schedule_phases_active_on_current_date(
+    vault: Path,
+    monkeypatch,
+):
+    from datetime import datetime
+    from zoneinfo import ZoneInfo
+
+    from plugins.study_os.context import study_planning_context
+    from plugins.study_os.learning import handle_study_activity
+
+    monkeypatch.setenv("OBSIDIAN_VAULT_PATH", str(vault))
+    initialized = _loads(
+        handle_study_activity(
+            {
+                "resource": "project",
+                "action": "init",
+                "vault_path": str(vault),
+                "data": {"project_id": "kaoyan-2027"},
+            }
+        )
+    )
+    schedule = _valid_study_schedule()
+    schedule["events"] = []
+    saved = _loads(
+        handle_study_activity(
+            {
+                "resource": "schedule",
+                "action": "save",
+                "vault_path": str(vault),
+                "project_id": "kaoyan-2027",
+                "data": schedule,
+            }
+        )
+    )
+
+    context = study_planning_context(
+        user_message="/study-os",
+        as_of=datetime(2026, 7, 18, 8, 0, tzinfo=ZoneInfo("Asia/Shanghai")),
+    )
+
+    assert initialized["ok"] is True
+    assert saved["ok"] is True
+    assert context is not None
+    prompt = context["context"]
+    for required in (
+        "kaoyan-2027-master-plan",
+        "2027 考研数学基础阶段计划",
+        "基础阶段",
+        "完成核心考点覆盖",
+        "2026-07-01",
+        "2026-09-30",
+    ):
+        assert required in prompt
+    loaded_skill_context = study_planning_context(
+        user_message=(
+            '[IMPORTANT: The user has invoked the "study-os" skill, indicating they want '
+            "you to follow its instructions.]"
+        ),
+        as_of=datetime(2026, 7, 18, 8, 0, tzinfo=ZoneInfo("Asia/Shanghai")),
+    )
+    assert loaded_skill_context is not None
+    assert "基础阶段" in loaded_skill_context["context"]
+    assert (
+        study_planning_context(
+            user_message="/study-os",
+            as_of=datetime(2026, 6, 18, 8, 0, tzinfo=ZoneInfo("Asia/Shanghai")),
+        )
+        is None
+    )
+
+
 def test_registered_learning_runtime_binds_and_unbinds_real_pre_llm_hook(vault: Path, monkeypatch):
     from hermes_cli import plugins as plugins_mod
     from hermes_cli.plugins import PluginContext, PluginManager, PluginManifest
@@ -1970,6 +2336,7 @@ def test_registered_learning_runtime_binds_and_unbinds_real_pre_llm_hook(vault: 
 
     manager = PluginManager()
     monkeypatch.setattr(plugins_mod, "_plugin_manager", manager)
+    monkeypatch.setenv("OBSIDIAN_VAULT_PATH", str(vault))
     manifest = PluginManifest(name="study_os", version="0.1.0", description="study", source="bundled")
     ctx = PluginContext(manifest, manager)
 
@@ -2037,6 +2404,13 @@ def test_registered_learning_runtime_binds_and_unbinds_real_pre_llm_hook(vault: 
         )
         assert finished["ok"] is True
         assert manager.invoke_hook("pre_llm_call", session_id="hermes-e2e-learning-001") == []
+        planning_results = manager.invoke_hook(
+            "pre_llm_call",
+            session_id="hermes-e2e-learning-001",
+            user_message="请把线性代数规划登记到 StudyOS 日历。",
+        )
+        assert len(planning_results) == 1
+        assert "schedule.save" in planning_results[0]["context"]
     finally:
         for name in ("study_activity", "study_coach"):
             registry.deregister(name)
@@ -2075,7 +2449,6 @@ def test_review_runner_reads_hidden_answer_and_submits_one_compound_result(vault
                 "response": "先求导，再按参数符号分类讨论。",
                 "result": "correct",
                 "duration_seconds": 93,
-                "self_confidence": 4,
                 "transfer_level": "execution",
                 "diagnoses": [],
             }
@@ -2088,13 +2461,128 @@ def test_review_runner_reads_hidden_answer_and_submits_one_compound_result(vault
     assert detail["data"]["answer_markdown"].startswith("## 解析")
     assert submitted["ok"] is True
     assert submitted["data"]["attempt"]["item_id"] == "math/examples/derivative.md"
-    assert submitted["data"]["attempt"]["self_confidence"] == 4
+    assert "self_confidence" not in submitted["data"]["attempt"]
     assert submitted["data"]["review"]["review_level"] == {"old": 2, "new": 3}
     assert submitted["data"]["completed_today_increment"] == 1
     assert submitted["data"]["completed_today"] == 1
     updated = note.read_text(encoding="utf-8")
     assert "review_level: 3" in updated
     assert "review_count: 2" in updated
+
+
+def test_review_submission_advances_review_level_automatically(vault: Path):
+    from plugins.study_os.learning import handle_study_review_submission
+    from plugins.study_os.tools import handle_study_project
+
+    initialized = _loads(handle_study_project({"vault_path": str(vault), "action": "init", "project_id": "calculus-2027"}))
+    assert initialized["ok"] is True
+    note = vault / "math" / "examples" / "semantic-level.md"
+    note.parent.mkdir(parents=True, exist_ok=True)
+    note.write_text(
+        "---\n"
+        "title: Semantic review level\n"
+        "type: example\n"
+        "review_level: 1\n"
+        "---\n\n"
+        "# Question\n",
+        encoding="utf-8",
+    )
+    submission = {
+        "vault_path": str(vault),
+        "project_id": "calculus-2027",
+        "note": "math/examples/semantic-level.md",
+        "response": "A completely correct first attempt.",
+        "result": "correct",
+        "duration_seconds": 30,
+    }
+
+    submitted = _loads(handle_study_review_submission(submission))
+
+    assert submitted["ok"] is True
+    assert "self_confidence" not in submitted["data"]["attempt"]
+    assert submitted["data"]["review"]["review_level"] == {"old": 1, "new": 3}
+    assert "review_level: 3" in note.read_text(encoding="utf-8")
+
+    second = _loads(
+        handle_study_review_submission(
+            {
+                **submission,
+                "attempt_id": "att-second-correct",
+                "occurred_at": "2026-07-13T10:00:00+08:00",
+            }
+        )
+    )
+    third = _loads(
+        handle_study_review_submission(
+            {
+                **submission,
+                "attempt_id": "att-third-correct",
+                "occurred_at": "2026-07-14T10:00:00+08:00",
+            }
+        )
+    )
+
+    assert second["data"]["review"]["review_level"] == {"old": 3, "new": 4}
+    assert third["data"]["review"]["review_level"] == {"old": 4, "new": 5}
+
+
+def test_review_submission_maps_answer_understanding_to_level_two(vault: Path):
+    from plugins.study_os.learning import handle_study_review_submission
+    from plugins.study_os.tools import handle_study_project
+
+    initialized = _loads(handle_study_project({"vault_path": str(vault), "action": "init", "project_id": "calculus-2027"}))
+    assert initialized["ok"] is True
+    note = vault / "math" / "examples" / "understood-answer.md"
+    note.parent.mkdir(parents=True, exist_ok=True)
+    note.write_text(
+        "---\n"
+        "title: Understood answer\n"
+        "type: example\n"
+        "review_level: 5\n"
+        "---\n\n"
+        "# Question\n",
+        encoding="utf-8",
+    )
+
+    submitted = _loads(
+        handle_study_review_submission(
+            {
+                "vault_path": str(vault),
+                "project_id": "calculus-2027",
+                "note": "math/examples/understood-answer.md",
+                "response": "I understand the reference answer.",
+                "result": "partial",
+                "duration_seconds": 30,
+            }
+        )
+    )
+
+    assert submitted["ok"] is True
+    assert submitted["data"]["review"]["review_level"] == {"old": 5, "new": 2}
+
+
+def test_diagnosis_ignores_legacy_self_confidence(vault: Path):
+    from plugins.study_os.learning import _all_attempts, _diagnosis
+
+    activity = vault / ".StudyOS" / "projects" / "legacy-project" / "activity"
+    activity.mkdir(parents=True)
+    (activity / "attempts-2026-07.jsonl").write_text(
+        json.dumps(
+            {
+                "attempt_id": "legacy-high-confidence-error",
+                "result": "incorrect",
+                "score": 0.0,
+                "self_confidence": 5,
+            }
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    attempts = _all_attempts(vault, "legacy-project")
+    diagnosis = _diagnosis(attempts)
+
+    assert attempts[0]["self_confidence"] == 5
+    assert "calibration" not in diagnosis
 
 
 def test_review_runner_rolls_back_attempt_when_review_update_fails(vault: Path, monkeypatch):
@@ -2123,7 +2611,6 @@ def test_review_runner_rolls_back_attempt_when_review_update_fails(vault: Path, 
                 "response": "answer",
                 "result": "incorrect",
                 "duration_seconds": 12,
-                "self_confidence": 3,
             }
         )
     )
@@ -2176,6 +2663,201 @@ def test_read_note_resolves_title_alias_and_extracts_links(vault: Path):
     assert note["layer"] == "concept"
     assert "进程控制块" in note["wikilinks"]
     assert "body" in note
+
+
+def test_note_save_rejects_recursive_dangling_wikilinks_atomically(vault: Path):
+    from plugins.study_os.learning import handle_study_activity
+
+    result = _loads(
+        handle_study_activity(
+            {
+                "resource": "note",
+                "action": "save",
+                "data": {
+                    "vault_path": str(vault),
+                    "notes": [
+                        {
+                            "path": "OS/Box/调度.md",
+                            "content": "# 调度\n\n依赖 [[进程]]。\n",
+                        },
+                        {
+                            "path": "OS/Box/进程.md",
+                            "content": "# 进程\n\n由 [[进程控制块]] 表示。\n",
+                        },
+                    ],
+                },
+            }
+        )
+    )
+
+    assert result["ok"] is False
+    assert result["error"]["code"] == "BROKEN_WIKILINKS"
+    assert result["error"]["details"]["missing"] == [
+        {
+            "source": "OS/Box/进程.md",
+            "target": "进程控制块",
+        }
+    ]
+    assert not (vault / "OS" / "Box" / "调度.md").exists()
+    assert not (vault / "OS" / "Box" / "进程.md").exists()
+
+
+def test_note_save_writes_recursively_closed_batch_and_invalidates_graph_cache(
+    vault: Path,
+):
+    from plugins.study_os.learning import handle_study_activity
+
+    graph_cache = vault / ".StudyOS" / "concept_graph.json"
+    graph_cache.parent.mkdir()
+    graph_cache.write_text('{"stale": true}', encoding="utf-8")
+    result = _loads(
+        handle_study_activity(
+            {
+                "resource": "note",
+                "action": "save",
+                "data": {
+                    "vault_path": str(vault),
+                    "notes": [
+                        {
+                            "path": "OS/Box/调度.md",
+                            "content": "# 调度\n\n依赖 [[进程]]。\n",
+                        },
+                        {
+                            "path": "OS/Box/进程.md",
+                            "content": "# 进程\n\n由 [[进程控制块]] 表示。\n",
+                        },
+                        {
+                            "path": "OS/Box/进程控制块.md",
+                            "content": "# 进程控制块\n\n记录进程状态和上下文。\n",
+                        },
+                    ],
+                },
+            }
+        )
+    )
+
+    assert result["ok"] is True
+    assert result["data"]["saved"] is True
+    assert result["data"]["broken_links"] == []
+    assert result["data"]["graph"]["edge_count"] == 2
+    assert {
+        item["path"] for item in result["data"]["notes"]
+    } == {
+        "OS/Box/调度.md",
+        "OS/Box/进程.md",
+        "OS/Box/进程控制块.md",
+    }
+    assert (vault / "OS" / "Box" / "调度.md").is_file()
+    assert (vault / "OS" / "Box" / "进程.md").is_file()
+    assert (vault / "OS" / "Box" / "进程控制块.md").is_file()
+    assert not graph_cache.exists()
+
+
+def test_note_graph_reports_transitive_existing_dangling_links(vault: Path):
+    from plugins.study_os.learning import handle_study_activity
+
+    (vault / "OS" / "Box" / "线程.md").write_text(
+        "# 线程\n\n依赖 [[线程控制块]]。\n",
+        encoding="utf-8",
+    )
+    (vault / "OS" / "Box" / "并发.md").write_text(
+        "# 并发\n\n参见 [[线程]]。\n",
+        encoding="utf-8",
+    )
+    result = _loads(
+        handle_study_activity(
+            {
+                "resource": "note",
+                "action": "graph",
+                "data": {
+                    "vault_path": str(vault),
+                    "roots": ["并发"],
+                },
+            }
+        )
+    )
+
+    assert result["ok"] is True
+    assert result["data"]["broken_link_count"] == 1
+    assert result["data"]["broken_links"] == [
+        {
+            "source": "OS/Box/线程.md",
+            "target": "线程控制块",
+        }
+    ]
+    assert result["data"]["graph"]["visited_notes"] == [
+        "OS/Box/并发.md",
+        "OS/Box/线程.md",
+    ]
+
+
+def test_note_save_accepts_existing_alias_and_attachment_targets(vault: Path):
+    from plugins.study_os.learning import handle_study_activity
+
+    attachment = vault / "OS" / "assets" / "process.png"
+    attachment.parent.mkdir(parents=True)
+    attachment.write_bytes(b"png")
+    result = _loads(
+        handle_study_activity(
+            {
+                "resource": "note",
+                "action": "save",
+                "data": {
+                    "vault_path": str(vault),
+                    "notes": [
+                        {
+                            "path": "OS/Box/进程总览.md",
+                            "content": (
+                                "# 进程总览\n\n"
+                                "参见 [[作业接纳]] 和 [[process.png]]。\n"
+                            ),
+                        },
+                        {
+                            "path": "OS/Box/进程控制块.md",
+                            "content": "# 进程控制块\n\n记录进程状态和上下文。\n",
+                        },
+                    ],
+                },
+            }
+        )
+    )
+
+    assert result["ok"] is True
+    assert result["data"]["graph"]["edge_count"] == 3
+    assert result["data"]["broken_links"] == []
+
+
+def test_note_save_rolls_back_earlier_writes_when_batch_write_fails(
+    vault: Path,
+    monkeypatch,
+):
+    from plugins.study_os import notes as note_module
+
+    existing = vault / "OS" / "Box" / "A.md"
+    existing.write_text("# Original A\n", encoding="utf-8")
+    original_write = note_module._write_text
+    calls = 0
+
+    def fail_second_write(path: Path, content: str):
+        nonlocal calls
+        calls += 1
+        if calls == 2:
+            raise OSError("disk full")
+        return original_write(path, content)
+
+    monkeypatch.setattr(note_module, "_write_text", fail_second_write)
+    with pytest.raises(OSError, match="disk full"):
+        note_module.save_note_batch(
+            vault,
+            [
+                {"path": "OS/Box/A.md", "content": "# A\n\n[[B]]\n"},
+                {"path": "OS/Box/B.md", "content": "# B\n"},
+            ],
+            overwrite=True,
+        )
+
+    assert existing.read_text(encoding="utf-8") == "# Original A\n"
+    assert not (vault / "OS" / "Box" / "B.md").exists()
 
 
 def test_extract_concepts_uses_frontmatter_and_candidates(vault: Path):

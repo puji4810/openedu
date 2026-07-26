@@ -392,7 +392,6 @@ class LearningRuntime:
             "dimensions": dimensions,
             "concepts": diagnosis.get("concepts", []),
             "diagnosis_clusters": diagnosis.get("diagnosis_clusters", []),
-            "calibration": diagnosis.get("calibration", {}),
             "score_delta_earlier_to_later": diagnosis.get("score_delta_earlier_to_later"),
             "evaluator_provenance": dict(provenance),
             "unverified_dimensions": [
@@ -517,7 +516,6 @@ class LearningRuntime:
             "score": observation.get("score"),
             "duration_seconds": observation.get("duration_seconds"),
             "hints_used": hints_used,
-            "self_confidence": observation.get("self_confidence"),
             "evaluator_confidence": observation.get("evaluator_confidence"),
             "evaluator": observation.get("evaluator"),
             "assistance": assistance,

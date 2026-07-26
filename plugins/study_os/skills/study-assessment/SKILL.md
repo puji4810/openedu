@@ -16,7 +16,7 @@ data={"intent":"assessment"})` or use `"error_analysis"`; never mutate system pr
    Read existing attempts first through `study_activity`. Use `study_coach` with the same scope; it may
    summarize or recommend but does not prove unobserved dimensions.
 2. For a new answer, classify outcome, reasoning, missed conditions, concept,
-   pattern, confidence, and next action. Record an immutable `attempt` first;
+   pattern, and next action. Record an immutable `attempt` first;
    log an `error` only when a concrete failure needs durable remediation. Each
    non-empty `diagnoses` item must be an object with non-empty `kind` and
    observed `evidence`, never a string label.

@@ -34,6 +34,7 @@ from plugins.study_os.notes import (
 from plugins.study_os.reviews import (
     StudyReviewReadModel,
     _LEARNING_STATES,
+    automatic_review_level as _automatic_review_level,
     calculate_next_review as _calculate_next_review,
     concept_ancestors as _concept_ancestors,
     concept_descendants as _concept_descendants,
@@ -812,6 +813,27 @@ def _review_filter_ints(args: dict[str, Any], key: str) -> set[int]:
     return set(values)
 
 
+def _review_path_prefixes(args: dict[str, Any], key: str) -> set[str]:
+    prefixes: set[str] = set()
+    for value in _review_filter_values(args, key):
+        raw_prefix = value.replace("\\", "/")
+        prefix = raw_prefix.strip("/")
+        if (
+            not prefix
+            or Path(raw_prefix).is_absolute()
+            or re.match(r"^[a-z]:/", raw_prefix)
+            or ".." in Path(prefix).parts
+        ):
+            raise ValueError(f"{key} must contain vault-relative path prefixes")
+        prefixes.add(prefix)
+    return prefixes
+
+
+def _review_path_is_excluded(note_path: str, prefixes: set[str]) -> bool:
+    normalized = note_path.replace("\\", "/").strip("/").casefold()
+    return any(normalized == prefix or normalized.startswith(f"{prefix}/") for prefix in prefixes)
+
+
 # ---------------------------------------------------------------------------
 # study_due_reviews
 # ---------------------------------------------------------------------------
@@ -830,6 +852,7 @@ def handle_study_due_reviews(args: dict[str, Any], **_kwargs) -> str:
         notes_filter = _review_filter_values(args, "notes")
         notes_filter.update(_review_filter_values(args, "paths"))
         tags_filter = _review_filter_values(args, "tags")
+        exclude_paths = _review_path_prefixes(args, "exclude_paths")
         concepts_filter = _review_filter_values(args, "concepts")
         difficulties_filter = _review_filter_values(args, "difficulties")
         review_levels_filter = _review_filter_ints(args, "review_levels")
@@ -859,6 +882,9 @@ def handle_study_due_reviews(args: dict[str, Any], **_kwargs) -> str:
         # root-level examples/ directory silently empties the review queue for
         # the latter layout.  An explicitly supplied folder remains scoped.
         for path in _iter_markdown_notes(vault, folder=folder):
+            relative_path = path.relative_to(vault).as_posix()
+            if _review_path_is_excluded(relative_path, exclude_paths):
+                continue
             note, note_warnings = parse_note(path, vault, include_body=False)
             warnings.extend(note_warnings)
             if note.get("layer") != "example":
@@ -935,17 +961,38 @@ def handle_study_due_reviews(args: dict[str, Any], **_kwargs) -> str:
             )
         else:
             due.sort(key=lambda item: (item["title"].casefold(), item["path"]))
+        selected = due[:limit]
+        selection: dict[str, Any] = {
+            "review_state": review_state,
+            "sort": sort_by,
+            "match": match_mode,
+            "limit": limit,
+        }
+        for key, values in (
+            ("subjects", subjects_filter),
+            ("notes", notes_filter),
+            ("tags", tags_filter),
+            ("exclude_paths", exclude_paths),
+            ("concepts", concepts_filter),
+            ("difficulties", difficulties_filter),
+            ("review_levels", review_levels_filter),
+        ):
+            if values:
+                selection[key] = sorted(values)
+        if folder:
+            selection["folder"] = folder
+        if min_level is not None:
+            selection["min_review_level"] = min_level
+        if max_level is not None:
+            selection["max_review_level"] = max_level
         return _ok({
             "vault_path": str(vault),
             "date": today.isoformat(),
-            "count": min(len(due), limit),
+            "count": len(selected),
+            "available_count": len(due),
             "subjects": sorted(subjects),
-            "due": due[:limit],
-            "selection": {
-                "review_state": review_state,
-                "sort": sort_by,
-                "match": match_mode,
-            },
+            "due": selected,
+            "selection": selection,
         }, warnings)
     except Exception as exc:
         return _err("DUE_REVIEWS_FAILED", str(exc))
@@ -977,22 +1024,16 @@ def handle_study_record_review(args: dict[str, Any], **_kwargs) -> str:
         fm = note.get("frontmatter", {})
         old_rl = int(fm.get("review_level", 0))
         old_count = int(fm.get("review_count", 0))
-        passed = bool(args.get("passed", True))
-
-        # Optional: user can override review_level
-        new_rl = args.get("new_review_level")
-        if new_rl is not None:
-            try:
-                new_rl = int(new_rl)
-                new_rl = max(0, min(5, new_rl))
-            except (ValueError, TypeError):
-                new_rl = old_rl
-        else:
-            new_rl = old_rl
+        result = args.get("result")
+        if result is None:
+            result = "correct" if bool(args.get("passed", True)) else "incorrect"
+        if result not in {"correct", "partial", "incorrect"}:
+            return _err("VALIDATION_FAILED", "result must be correct, partial, or incorrect")
+        passed = result == "correct"
+        new_rl = _automatic_review_level(old_rl, result)
 
         # Calculate next review
-        effective_rl = new_rl if new_rl is not None else old_rl
-        new_count, next_date = _calculate_next_review(old_count, effective_rl, passed)
+        new_count, next_date = _calculate_next_review(old_count, new_rl, passed)
 
         # Update frontmatter
         _upsert_frontmatter_field(path, "last_reviewed_at", date.today())
@@ -1047,38 +1088,39 @@ def handle_study_record_review(args: dict[str, Any], **_kwargs) -> str:
 # ---------------------------------------------------------------------------
 
 STUDY_DUE_REVIEWS_SCHEMA = {
-    "description": "Build a review queue from example notes. Defaults to due items and priority order (lowest review_level, then oldest review). Select explicitly by note paths, subjects/tags/concepts, difficulty, level, review state, and order.",
+    "description": "Build a review queue from example notes, defaulting to due items in priority order. Hidden directories are excluded. Select YAML tags and an exact maximum count with tags plus limit; exclude unrelated vault-relative path prefixes with exclude_paths.",
     "parameters": {
         "type": "object",
         "properties": {
             "vault_path": _VAULT_PROP,
-            "folder": {"type": "string", "description": "Folder to scan. Defaults to 'examples'."},
+            "folder": {"type": "string", "description": "Optional vault-relative folder; omit it to discover example notes across the vault."},
             "subject": {"type": "string", "description": "Backward-compatible single subject selector; matches subject, tag, or concept case-insensitively."},
             "subjects": {"type": "array", "items": {"type": "string"}, "description": "Subject selectors. Combined with other selector types using AND."},
             "notes": {"type": "array", "items": {"type": "string"}, "description": "Exact vault-relative example paths. Use for a user-selected question set."},
-            "tags": {"type": "array", "items": {"type": "string"}, "description": "Tag selectors without #."},
+            "tags": {"type": "array", "items": {"type": "string"}, "description": "Exact case-insensitive YAML frontmatter tag selectors without #."},
+            "exclude_paths": {"type": "array", "items": {"type": "string"}, "description": "Vault-relative file or directory prefixes to exclude, such as .opencode or archive."},
             "concepts": {"type": "array", "items": {"type": "string"}, "description": "Concept selectors; matches a concept name case-insensitively."},
             "difficulties": {"type": "array", "items": {"type": "string"}, "description": "Difficulty values, such as easy, medium, or hard."},
-            "review_levels": {"type": "array", "items": {"type": "integer"}, "description": "Exact review levels (0-5)."},
-            "min_review_level": {"type": "integer", "description": "Inclusive minimum review level (0-5)."},
-            "max_review_level": {"type": "integer", "description": "Inclusive maximum review level (0-5)."},
+            "review_levels": {"type": "array", "items": {"type": "integer", "minimum": 0, "maximum": 5}, "description": "Exact review levels (0-5)."},
+            "min_review_level": {"type": "integer", "minimum": 0, "maximum": 5, "description": "Inclusive minimum review level (0-5)."},
+            "max_review_level": {"type": "integer", "minimum": 0, "maximum": 5, "description": "Inclusive maximum review level (0-5)."},
             "review_state": {"type": "string", "enum": ["due", "all", "new", "reviewed"], "description": "due is default; all permits targeted practice of non-due items."},
             "match": {"type": "string", "enum": ["any", "all"], "description": "How multiple values in subjects/tags/concepts match; default any."},
             "sort": {"type": "string", "enum": ["priority", "oldest", "newest", "difficulty_asc", "difficulty_desc", "title"], "description": "Queue order; default priority."},
-            "limit": {"type": "integer", "description": "Maximum due notes to return (default 30)."},
+            "limit": {"type": "integer", "minimum": 1, "maximum": MAX_LIST_LIMIT, "description": "Maximum matching notes to return (default 30); never broadens selectors to fill the count."},
         },
     },
 }
 
 STUDY_RECORD_REVIEW_SCHEMA = {
-    "description": "Record the result of a spaced-repetition review. Updates review_count, last_reviewed_at, next_review_at in the note's YAML frontmatter. On pass: Ebbinghaus interval advances. On fail: interval resets to 1 day. Optionally logs an error record for failed reviews.",
+    "description": "Record the result of a spaced-repetition review. Automatically assigns review level: incorrect=1, partial=2, correct advances from at least 3 through 5. Updates review_count, last_reviewed_at, and next_review_at in the note's YAML frontmatter.",
     "parameters": {
         "type": "object",
         "properties": {
             "vault_path": _VAULT_PROP,
             "note": {"type": "string", "description": "Vault-relative path, basename, title, or wikilink target of the reviewed note."},
-            "passed": {"type": "boolean", "description": "Whether the review was successful (default true)."},
-            "new_review_level": {"type": "integer", "description": "Optional: update review_level (0-5). If omitted, level stays unchanged."},
+            "result": {"type": "string", "enum": ["correct", "partial", "incorrect"], "description": "Observed result used to assign the review level automatically."},
+            "passed": {"type": "boolean", "description": "Deprecated compatibility input used only when result is absent."},
             "log_error": {"type": "boolean", "description": "If review failed, also log an error record (default false)."},
             "cause": {"type": "string", "description": "Error cause (for log_error). See study_profile.md for taxonomy."},
             "concepts": {"type": "array", "items": {"type": "string"}, "description": "Related concepts (for error log)."},
@@ -2094,10 +2136,17 @@ def handle_study_prompt_context(args: dict[str, Any], **_kwargs) -> str:
                 return _err("PROMPT_CONTEXT_TOO_LARGE" if "exceeds" in warning else "PROMPT_CONTEXT_SOURCE_MISSING", warning)
             if fragment:
                 fragments.append(fragment)
+        total_max_chars = int(policy["total_max_chars"])
+        fixed_char_count = sum(fragment["char_count"] for fragment in fragments)
+        if fixed_char_count > total_max_chars:
+            return _err("PROMPT_CONTEXT_TOO_LARGE", f"prompt context exceeds {total_max_chars} total characters")
         summary_path = _project_dir(vault, project["project_id"]) / "prompt_summary.md"
         if summary_path.exists():
             content = _read_text(summary_path)
-            max_chars = int(policy["project_summary_max_chars"])
+            max_chars = min(
+                int(policy["project_summary_max_chars"]),
+                total_max_chars - fixed_char_count,
+            )
             if len(content) > max_chars:
                 content = content[:max_chars]
                 warnings.append(f"project_summary truncated to {max_chars} characters")
@@ -2110,8 +2159,8 @@ def handle_study_prompt_context(args: dict[str, Any], **_kwargs) -> str:
                 }
             )
         total = sum(fragment["char_count"] for fragment in fragments)
-        if total > int(policy["total_max_chars"]):
-            return _err("PROMPT_CONTEXT_TOO_LARGE", f"prompt context exceeds {policy['total_max_chars']} total characters")
+        if total > total_max_chars:
+            return _err("PROMPT_CONTEXT_TOO_LARGE", f"prompt context exceeds {total_max_chars} total characters")
         return _ok(
             {
                 "intent": intent,

@@ -407,14 +407,13 @@ def test_study_review_runner_endpoints_share_one_submission_contract(monkeypatch
         response="按定义求导",
         result="correct",
         duration_seconds=42,
-        self_confidence=4,
         transfer_level="execution",
     )
 
     assert detail["prompt_markdown"].endswith("求导。")
     assert detail["answer_markdown"].startswith("## 答案")
     assert submitted["attempt"]["response"] == "按定义求导"
-    assert submitted["review"]["review_level"] == {"old": 1, "new": 2}
+    assert submitted["review"]["review_level"] == {"old": 1, "new": 3}
 
 
 def test_study_settings_persist_profile_vault_and_opt_in_toolset(monkeypatch, tmp_path: Path):

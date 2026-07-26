@@ -2,16 +2,14 @@ import { useState } from 'react'
 
 import { Button } from '@/components/ui/button'
 import { useI18n } from '@/i18n'
-import type { StudyIntervention, StudyOverviewResponse } from '@/types/hermes'
+import type { StudyOverviewResponse } from '@/types/hermes'
+
+import { buildStudyInterventionCommand } from './agent-command'
 
 interface StudyInboxProps {
   onDecide: (proposalId: string, action: 'accept' | 'reject') => Promise<void>
   onStartAgent?: (prompt: string) => void | Promise<void>
   overview: StudyOverviewResponse
-}
-
-function interventionPrompt(item: StudyIntervention): string {
-  return `Use StudyOS to run ${item.kind} for “${item.capability}”. Target ${item.evidence_dimension}, preserve evaluator and assistance provenance, then record the attempt.`
 }
 
 export function StudyInbox({ onDecide, onStartAgent, overview }: StudyInboxProps) {
@@ -114,7 +112,7 @@ export function StudyInbox({ onDecide, onStartAgent, overview }: StudyInboxProps
               {onStartAgent && (
                 <Button
                   className="mt-3"
-                  onClick={() => void onStartAgent(interventionPrompt(item))}
+                  onClick={() => void onStartAgent(buildStudyInterventionCommand(overview.project.project_id, item))}
                   size="sm"
                   variant="secondary"
                 >

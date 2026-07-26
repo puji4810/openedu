@@ -162,11 +162,11 @@ function overview(p: StudyProject = project(), s: StudySchedule = schedule()): S
   }
 }
 
-function renderStudy() {
+function renderStudy(onStartAgentReview?: (prompt: string) => void | Promise<void>) {
   return import('./index').then(({ StudyView }) =>
     render(
       <I18nProvider configClient={null}>
-        <StudyView />
+        <StudyView onStartAgentReview={onStartAgentReview} />
       </I18nProvider>
     )
   )
@@ -428,5 +428,49 @@ describe('StudyView', () => {
     expect(await screen.findByText('Independent execution check')).toBeTruthy()
     fireEvent.click(screen.getByRole('button', { name: 'Accept' }))
     await waitFor(() => expect(decideStudyPlanProposal).toHaveBeenCalledWith('kaoyan-2027', 'plan-execution', 'accept'))
+  })
+
+  it('dispatches the selected intervention through /study-os from Today and Suggestions', async () => {
+    const initial = overview()
+    initial.intervention_queue.items = [
+      {
+        intervention_id: 'iv-execution',
+        objective_id: 'project-readiness',
+        capability: 'Solve one transfer problem independently.',
+        kind: 'independence_probe',
+        evidence_dimension: 'execution',
+        priority_score: 80,
+        priority_band: 'high',
+        reasons: ['Successful execution evidence is not independently verified.'],
+        evidence_attempt_ids: ['att-self'],
+        recommended_activity: {
+          activity_kind: 'independence_probe',
+          evidence_target: 'execution',
+          assistance_level: 'independent',
+          duration_minutes: 30,
+          requires_evaluator: true,
+          success_criteria: ['Solve without hints.']
+        }
+      }
+    ]
+    getStudyOverview.mockResolvedValue(initial)
+    const onStartAgentReview = vi.fn()
+
+    await renderStudy(onStartAgentReview)
+
+    fireEvent.click(await screen.findByRole('button', { name: 'Start with agent' }))
+    expect(onStartAgentReview).toHaveBeenCalledTimes(1)
+
+    const todayCommand = String(onStartAgentReview.mock.calls[0]?.[0])
+    expect(todayCommand).toMatch(/^\/study-os\s/)
+    expect(todayCommand).toContain('"project_id": "kaoyan-2027"')
+    expect(todayCommand).toContain('"intervention_id": "iv-execution"')
+    expect(todayCommand).toContain('"duration_minutes": 30')
+    expect(todayCommand).toContain('"success_criteria": [')
+
+    fireEvent.click(screen.getByRole('button', { name: 'Suggestions' }))
+    fireEvent.click(await screen.findByRole('button', { name: 'Start with agent' }))
+    expect(onStartAgentReview).toHaveBeenCalledTimes(2)
+    expect(onStartAgentReview.mock.calls[1]?.[0]).toBe(todayCommand)
   })
 })

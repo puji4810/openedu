@@ -17,7 +17,6 @@ import {
   cancelReviewSession,
   openReviewItem,
   revealReviewAnswer,
-  setReviewConfidence,
   startReviewSession,
   submitReviewResult,
   tickReviewSession
@@ -50,7 +49,7 @@ export function ReviewRunner({
 }: ReviewRunnerProps) {
   const { t } = useI18n()
   const session = useStore($reviewSession)
-  const { activeItem, confidence, detail, elapsedSeconds, error, lastResult, response, status } = session
+  const { activeItem, detail, elapsedSeconds, error, lastResult, response, status } = session
 
   const answerRevealed =
     status === 'revealed' ||
@@ -180,33 +179,10 @@ export function ReviewRunner({
             value={response}
           />
         </div>
-        <div className="mt-4 shrink-0">
-          <div className="text-sm font-semibold">{t.study.confidence}</div>
-          <div className="mt-2 flex gap-2">
-            {[1, 2, 3, 4, 5].map(value => (
-              <button
-                aria-label={`${t.study.confidence} ${value}`}
-                className={cn(
-                  'size-9 rounded-full border text-sm font-medium transition-colors',
-                  confidence === value
-                    ? 'border-primary bg-primary text-primary-foreground'
-                    : 'bg-background hover:bg-accent'
-                )}
-                disabled={answerRevealed || submitting}
-                key={value}
-                onClick={() => setReviewConfidence(value)}
-                type="button"
-              >
-                {value}
-              </button>
-            ))}
-          </div>
-        </div>
-
         {!answerRevealed ? (
           <Button
             className="mt-5"
-            disabled={!projectId || !response.trim() || confidence === null}
+            disabled={!projectId || !response.trim()}
             onClick={revealReviewAnswer}
           >
             {t.study.revealAnswer}
@@ -224,10 +200,18 @@ export function ReviewRunner({
             <div>
               <div className="text-sm font-semibold">{t.study.selfGrade}</div>
               <div className="mt-2 flex flex-wrap gap-2">
-                <Button disabled={submitting} onClick={() => void submitResult('incorrect')} variant="destructive">
+                <Button
+                  disabled={submitting}
+                  onClick={() => void submitResult('incorrect')}
+                  variant="destructive"
+                >
                   {t.study.incorrect}
                 </Button>
-                <Button disabled={submitting} onClick={() => void submitResult('partial')} variant="secondary">
+                <Button
+                  disabled={submitting}
+                  onClick={() => void submitResult('partial')}
+                  variant="secondary"
+                >
                   {t.study.partial}
                 </Button>
                 <Button disabled={submitting} onClick={() => void submitResult('correct')}>

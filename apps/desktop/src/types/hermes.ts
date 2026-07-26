@@ -232,7 +232,6 @@ export interface StudyReviewSubmission {
   response: string
   result: StudyReviewResult
   duration_seconds: number
-  self_confidence: number
   transfer_level?: string
   diagnoses?: Array<Record<string, unknown>>
   evaluator?: {

@@ -166,7 +166,6 @@ class StudyReviewSubmissionRequest(BaseModel):
     response: str
     result: str
     duration_seconds: int
-    self_confidence: int
     transfer_level: str = "execution"
     diagnoses: Optional[list[dict[str, Any]]] = None
     evaluator: Optional[dict[str, Any]] = None

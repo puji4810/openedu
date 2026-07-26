@@ -15,7 +15,6 @@ export type ReviewSessionStatus = 'loading' | 'answering' | 'revealed' | 'submit
 
 export interface ReviewSessionState {
   activeItem: null | StudyReviewItem
-  confidence: null | number
   detail: null | StudyReviewDetail
   elapsedSeconds: number
   error: null | string
@@ -30,7 +29,6 @@ export interface ReviewSessionState {
 function initialState(): ReviewSessionState {
   return {
     activeItem: null,
-    confidence: null,
     detail: null,
     elapsedSeconds: 0,
     error: null,
@@ -92,7 +90,6 @@ export async function openReviewItem(
 
     $reviewSession.set({
       activeItem: item,
-      confidence: null,
       detail,
       elapsedSeconds: 0,
       error: null,
@@ -135,20 +132,10 @@ export function answerReview(response: string): void {
   $reviewSession.set({ ...state, response })
 }
 
-export function setReviewConfidence(confidence: number): void {
-  const state = $reviewSession.get()
-
-  if (state.status !== 'answering' || confidence < 1 || confidence > 5) {
-    return
-  }
-
-  $reviewSession.set({ ...state, confidence })
-}
-
 export function revealReviewAnswer(): void {
   const state = $reviewSession.get()
 
-  if (state.status !== 'answering' || !state.response.trim() || state.confidence === null) {
+  if (state.status !== 'answering' || !state.response.trim()) {
     return
   }
 
@@ -180,7 +167,7 @@ export async function submitReviewResult(
 ): Promise<null | number> {
   const state = $reviewSession.get()
 
-  if (!canSubmit(state) || !state.activeItem || !state.response.trim() || state.confidence === null) {
+  if (!canSubmit(state) || !state.activeItem || !state.response.trim()) {
     return null
   }
 
@@ -197,7 +184,6 @@ export async function submitReviewResult(
       project_id: options.projectId,
       response: state.response.trim(),
       result: options.result,
-      self_confidence: state.confidence,
       session_id: state.sessionId,
       transfer_level: 'execution'
     })

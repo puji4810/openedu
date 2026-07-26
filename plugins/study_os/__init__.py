@@ -10,7 +10,7 @@ from __future__ import annotations
 from pathlib import Path
 
 from agent.skill_utils import parse_frontmatter
-from plugins.study_os.context import active_learning_context
+from plugins.study_os.context import active_learning_context, study_planning_context
 from plugins.study_os.domain_packs import domain_pack_registry
 from plugins.study_os.learning import (
     STUDY_ACTIVITY_SCHEMA,
@@ -38,11 +38,12 @@ def register(ctx) -> None:
         )
 
     ctx.register_hook("pre_llm_call", active_learning_context)
+    ctx.register_hook("pre_llm_call", study_planning_context)
 
     skills_root = Path(__file__).resolve().parent / "skills"
     for name, description in (
         ("study-os", "Route StudyOS learning workflows."),
-        ("study-plan", "Plan StudyOS projects, interventions, and schedules."),
+        ("study-plan", "Create, revise, and persist StudyOS learning schedules."),
         ("study-organize", "Organize problems into StudyOS notes."),
         ("study-review", "Run StudyOS spaced repetition reviews."),
         ("study-teach", "Teach through StudyOS learning records."),

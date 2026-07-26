@@ -371,14 +371,6 @@ class InterventionOrchestrator:
                 )
                 if verification_status == "developing" and repeated_count:
                     score += min(12, repeated_count * 3)
-                high_confidence_errors = set(
-                    str(value)
-                    for value in diagnosis.get("calibration", {}).get(
-                        "high_confidence_error_attempt_ids", []
-                    )
-                )
-                if high_confidence_errors.intersection(evidence_ids):
-                    score += 8
                 score = min(100, score)
 
                 reasons = self._reasons(
