@@ -1060,6 +1060,28 @@ def _independently_verified(attempt: dict[str, Any]) -> bool:
     return _attempt_score(attempt) >= 0.8 and _assistance_level(attempt) == "independent" and evaluator_is_credible
 
 
+# One unaided success is a fluke; a dimension is only independent once it has
+# been demonstrated more than once AND the latest evidence still shows it. The
+# single-attempt rule this replaced reported 47 attempts averaging 0.62 as
+# independently mastered because exactly one of them was unaided -- and an
+# independent dimension is skipped by the Intervention Queue entirely, so the
+# mistake did not merely mislabel the capability, it stopped recommending it.
+MIN_INDEPENDENT_ATTEMPTS = 2
+
+
+def _latest_attempt(items: list[dict[str, Any]]) -> dict[str, Any]:
+    """The most recent attempt by its own timestamp, not by list order.
+
+    Callers hand this module attempt lists assembled in different ways, so
+    recency is read from the evidence rather than assumed from ordering.
+    """
+
+    return max(
+        items,
+        key=lambda item: (str(item.get("occurred_at") or ""), str(item.get("attempt_id") or "")),
+    )
+
+
 def _diagnosis(attempts: list[dict[str, Any]]) -> dict[str, Any]:
     diagnosis_groups: dict[tuple[str, str], list[str]] = defaultdict(list)
     concept_attempts: dict[str, list[dict[str, Any]]] = defaultdict(list)
@@ -1097,7 +1119,10 @@ def _diagnosis(attempts: list[dict[str, Any]]) -> dict[str, Any]:
         items = dimension_attempts.get(dimension, [])
         successful = [item for item in items if _attempt_score(item) >= 0.8]
         independently_verified = [item for item in items if _independently_verified(item)]
-        if independently_verified:
+        if (
+            len(independently_verified) >= MIN_INDEPENDENT_ATTEMPTS
+            and _independently_verified(_latest_attempt(items))
+        ):
             verification_status = "independent"
         elif successful:
             verification_status = "supported"

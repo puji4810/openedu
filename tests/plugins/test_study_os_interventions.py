@@ -100,10 +100,18 @@ def test_queue_selects_one_current_gap_per_objective_and_skips_fresh_independent
             occurred_at="2026-07-12T10:00:00+08:00",
             assistance="guided",
         ),
+        # Two unaided successes, the later of them most recent: independence
+        # now requires repetition, so a single attempt would read as supported.
         _attempt(
             "att-independent",
             objective_id="independent-objective",
             occurred_at="2026-07-12T11:00:00+08:00",
+            assistance="independent",
+        ),
+        _attempt(
+            "att-independent-2",
+            objective_id="independent-objective",
+            occurred_at="2026-07-12T12:00:00+08:00",
             assistance="independent",
         ),
     ]
@@ -139,7 +147,13 @@ def test_stale_independent_evidence_becomes_a_retention_probe():
             objective_id="trace-request",
             occurred_at="2026-05-01T10:00:00+08:00",
             assistance="independent",
-        )
+        ),
+        _attempt(
+            "att-independent-2",
+            objective_id="trace-request",
+            occurred_at="2026-05-01T11:00:00+08:00",
+            assistance="independent",
+        ),
     ]
 
     fresh = _build(project, attempts, "2026-05-10T10:00:00+08:00")

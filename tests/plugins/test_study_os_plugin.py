@@ -2818,7 +2818,32 @@ def test_research_adapter_requires_a_source_anchor_for_claim_evidence(vault: Pat
     assert accepted["ok"] is True
     assert accepted["data"]["evidence"]["score"] == 1.0
     assert accepted["data"]["evidence"]["source_anchors"][0]["kind"] == "paper"
-    assert accepted["data"]["competency_snapshot"]["dimensions"]["explanation"]["verification_status"] == "independent"
+    # One anchored, unaided success is supporting evidence, not demonstrated
+    # independence -- that needs a second showing.
+    assert accepted["data"]["competency_snapshot"]["dimensions"]["explanation"]["verification_status"] == "supported"
+
+    confirmed = _loads(
+        handle_study_coach(
+            {
+                "action": "advance",
+                "vault_path": str(vault),
+                "project_id": "research-unanchored",
+                "data": {
+                    "session_id": "learn-claim-001",
+                    "observation": {
+                        "response": "Section 5's ablation isolates latency and reproduces the effect without load.",
+                        "result": "correct",
+                        "source_anchors": [
+                            {"kind": "paper", "ref": "doi:10.0000/example", "locator": "section 5"}
+                        ],
+                        "evaluator": {"kind": "human", "id": "supervisor", "confidence": 0.9},
+                    },
+                },
+            }
+        )
+    )
+    assert confirmed["ok"] is True
+    assert confirmed["data"]["competency_snapshot"]["dimensions"]["explanation"]["verification_status"] == "independent"
 
     finished = _loads(
         handle_study_coach(

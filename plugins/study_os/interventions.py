@@ -217,9 +217,31 @@ def _kind_for(
     return "evidence_probe"
 
 
+def _activates_on(objective: dict[str, Any]) -> date | None:
+    raw = objective.get("activates_on")
+    if not raw:
+        return None
+    try:
+        return date.fromisoformat(str(raw))
+    except ValueError:
+        return None
+
+
 def _objective_views(
-    project: dict[str, Any], attempts: list[dict[str, Any]]
-) -> tuple[list[tuple[dict[str, Any], list[dict[str, Any]]]], list[str]]:
+    project: dict[str, Any],
+    attempts: list[dict[str, Any]],
+    as_of_date: date | None = None,
+) -> tuple[list[tuple[dict[str, Any], list[dict[str, Any]]]], list[str], list[str]]:
+    """Split evidence per Objective, holding back the ones not yet in scope.
+
+    An Objective may declare ``activates_on``.  A timed full-paper Objective is
+    a real target with no evidence, so it scores as the most urgent gap in the
+    queue and keeps recommending a mock exam to a learner who is still on their
+    first pass through the syllabus.  Deferring it is not the same as hiding
+    it: evidence recorded against a deferred Objective is still attributed, and
+    the queue reports which Objectives it held back and until when.
+    """
+
     if project.get("schema_version") != PROJECT_SCHEMA_VERSION:
         synthetic = {
             "objective_id": "project-readiness",
@@ -230,13 +252,14 @@ def _objective_views(
             "evidence_targets": list(EVIDENCE_DIMENSIONS),
             "source_anchors": [],
         }
-        return [(synthetic, attempts)], []
+        return [(synthetic, attempts)], [], []
 
     objectives = [
         item for item in project.get("objectives", []) if isinstance(item, dict)
     ]
     known_ids = {str(item.get("objective_id")) for item in objectives}
     views: list[tuple[dict[str, Any], list[dict[str, Any]]]] = []
+    deferred: list[str] = []
     scoped_ids: set[str] = set()
     for objective in objectives:
         objective_id = str(objective.get("objective_id"))
@@ -246,7 +269,13 @@ def _objective_views(
             if objective_id
             in {str(value) for value in attempt.get("objective_ids", [])}
         ]
+        # Attribution happens for every Objective, active or not, so deferring
+        # one never pushes its evidence into the unscoped bucket.
         scoped_ids.update(_attempt_id(item) for item in scoped)
+        activates_on = _activates_on(objective)
+        if as_of_date is not None and activates_on is not None and as_of_date < activates_on:
+            deferred.append(f"{objective_id} until {activates_on.isoformat()}")
+            continue
         views.append((objective, scoped))
     unscoped = [
         _attempt_id(attempt)
@@ -259,7 +288,7 @@ def _objective_views(
             )
         )
     ]
-    return views, _unique(unscoped)
+    return views, _unique(unscoped), deferred
 
 
 class InterventionOrchestrator:
@@ -294,8 +323,8 @@ class InterventionOrchestrator:
 
         project_deadline = _deadline(self._project)
         days_to_deadline, deadline_band = _deadline_state(self._project, as_of)
-        objective_views, unscoped_attempt_ids = _objective_views(
-            self._project, attempts
+        objective_views, unscoped_attempt_ids, deferred_objectives = _objective_views(
+            self._project, attempts, as_of.date()
         )
         candidates: list[tuple[int, int, dict[str, Any]]] = []
         considered_evidence: list[str] = []
@@ -462,11 +491,20 @@ class InterventionOrchestrator:
             "items": items,
             "evidence_attempt_ids": _unique(considered_evidence),
             "unscoped_attempt_ids": unscoped_attempt_ids,
+            "deferred_objectives": deferred_objectives,
             "warnings": (
                 [
                     "Some attempts were not attributed to a declared Objective and did not affect priority."
                 ]
                 if unscoped_attempt_ids
+                else []
+            )
+            + (
+                [
+                    "Objectives not yet in scope were held back: "
+                    + "; ".join(deferred_objectives)
+                ]
+                if deferred_objectives
                 else []
             ),
         }

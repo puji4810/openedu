@@ -6,6 +6,7 @@ export interface StudyObjective {
   success_criteria: Array<string>
   evidence_targets: Array<"recall" | "recognition" | "execution" | "explanation" | "near_transfer" | "far_transfer">
   source_anchors?: Array<StudySourceAnchor> | null
+  activates_on?: string | null
   [key: string]: unknown
 }
 
@@ -131,6 +132,20 @@ const STUDY_CONTRACT_SCHEMA = {
     "StudyObjective": {
       "additionalProperties": true,
       "properties": {
+        "activates_on": {
+          "anyOf": [
+            {
+              "format": "date",
+              "pattern": "^\\d{4}-\\d{2}-\\d{2}$",
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Activates On"
+        },
         "capability": {
           "pattern": "\\S",
           "title": "Capability",

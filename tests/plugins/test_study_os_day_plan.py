@@ -801,3 +801,147 @@ def test_desktop_apply_failure_still_reports_the_recorded_decision(planned_vault
     assert result["proposal"]["status"] == "accepted"
     assert result["applied"] == []
     assert result["apply_error"]["code"] == "PHASE_DRIFTED"
+
+
+# ── verification thresholds and activation windows ────────────────────────
+
+
+def _dim_attempt(index: int, *, independent: bool, day: int = 20):
+    return {
+        "attempt_id": f"a{index}",
+        "occurred_at": f"2026-07-{day:02d}T10:00:00+08:00",
+        "transfer_level": "execution",
+        "result": "correct" if independent else "incorrect",
+        "score": 1.0 if independent else 0.2,
+        "evaluator": {"kind": "human" if independent else "agent"},
+        "assistance": {"level": "independent" if independent else "guided"},
+        "concepts": [],
+        "diagnoses": [],
+    }
+
+
+def _status(attempts):
+    from plugins.study_os.learning import _diagnosis
+
+    return _diagnosis(attempts)["evidence_dimensions"]["execution"]["verification_status"]
+
+
+def test_one_unaided_success_no_longer_certifies_a_dimension():
+    """27 failures and one lucky success is not independent mastery."""
+
+    attempts = [_dim_attempt(i, independent=False, day=10 + i % 10) for i in range(27)]
+    attempts.append(_dim_attempt(99, independent=True, day=5))
+
+    assert _status(attempts) == "supported"
+
+
+def test_two_unaided_successes_with_a_current_one_certify():
+    attempts = [
+        _dim_attempt(0, independent=False, day=10),
+        _dim_attempt(1, independent=True, day=11),
+        _dim_attempt(2, independent=True, day=12),
+    ]
+
+    assert _status(attempts) == "independent"
+
+
+def test_a_later_regression_withdraws_independence():
+    attempts = [
+        _dim_attempt(0, independent=True, day=10),
+        _dim_attempt(1, independent=True, day=11),
+        _dim_attempt(2, independent=False, day=12),
+    ]
+
+    assert _status(attempts) == "supported"
+
+
+def test_recency_is_read_from_timestamps_not_list_order():
+    attempts = [
+        _dim_attempt(2, independent=False, day=12),
+        _dim_attempt(0, independent=True, day=13),
+        _dim_attempt(1, independent=True, day=14),
+    ]
+
+    assert _status(attempts) == "independent"
+
+
+def _objective(objective_id: str, activates_on: str | None = None) -> dict:
+    objective = {
+        "objective_id": objective_id,
+        "capability": f"Capability {objective_id}",
+        "success_criteria": ["Solve independently."],
+        "evidence_targets": ["execution"],
+    }
+    if activates_on:
+        objective["activates_on"] = activates_on
+    return objective
+
+
+def _queue(objectives, when: str, attempts=None):
+    from datetime import datetime
+
+    from plugins.study_os.interventions import InterventionOrchestrator
+
+    project = {
+        "schema_version": "study_project.v2",
+        "project_id": "window-project",
+        "title": "Window",
+        "timezone": "Asia/Shanghai",
+        "objectives": objectives,
+    }
+    return InterventionOrchestrator(
+        project=project,
+        diagnosis_builder=lambda items: {
+            "evidence_dimensions": {},
+            "diagnosis_clusters": [],
+        },
+    ).build(
+        attempts=attempts or [],
+        as_of=datetime.fromisoformat(when),
+        max_items=10,
+    )["queue"]
+
+
+def test_an_objective_is_held_back_until_it_activates():
+    objectives = [_objective("alpha-solving"), _objective("timed-integrated", "2026-09-01")]
+
+    queue = _queue(objectives, "2026-07-26T10:00:00+08:00")
+
+    assert [item["objective_id"] for item in queue["items"]] == ["alpha-solving"]
+    assert queue["deferred_objectives"] == ["timed-integrated until 2026-09-01"]
+    assert any("held back" in warning for warning in queue["warnings"])
+
+
+def test_an_objective_enters_the_queue_on_its_activation_date():
+    objectives = [_objective("alpha-solving"), _objective("timed-integrated", "2026-09-01")]
+
+    queue = _queue(objectives, "2026-09-01T10:00:00+08:00")
+
+    assert {item["objective_id"] for item in queue["items"]} == {
+        "alpha-solving",
+        "timed-integrated",
+    }
+    assert queue["deferred_objectives"] == []
+
+
+def test_deferring_an_objective_does_not_orphan_its_evidence():
+    """A deferred Objective still owns its attempts, so they are not 'unscoped'."""
+
+    attempts = [
+        {
+            "attempt_id": "a1",
+            "occurred_at": "2026-07-20T10:00:00+08:00",
+            "objective_ids": ["timed-integrated"],
+            "transfer_level": "execution",
+            "result": "correct",
+            "score": 1.0,
+            "evaluator": {"kind": "agent"},
+            "concepts": [],
+            "diagnoses": [],
+        }
+    ]
+    objectives = [_objective("alpha-solving"), _objective("timed-integrated", "2026-09-01")]
+
+    queue = _queue(objectives, "2026-07-26T10:00:00+08:00", attempts)
+
+    assert queue["unscoped_attempt_ids"] == []

@@ -137,6 +137,11 @@ class StudyObjective(_ContractModel):
         ]
     ] = Field(min_length=1)
     source_anchors: list[StudySourceAnchor] | None = None
+    # The date this Objective enters the Intervention Queue. A timed
+    # full-paper Objective is real from day one but should not be recommended
+    # during a first pass through the syllabus; before this date it is
+    # deferred, and its evidence is still attributed.
+    activates_on: IsoDate | None = None
 
 
 class StudyPromptPolicy(_ContractModel):
