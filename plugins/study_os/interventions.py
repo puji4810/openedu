@@ -16,6 +16,7 @@ from datetime import date, datetime
 from typing import Any
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
+from plugins.study_os.day_plan import build_day_plan
 from plugins.study_os.domain_packs import domain_pack_for
 from plugins.study_os.schemas import (
     EVIDENCE_DIMENSIONS,
@@ -279,6 +280,7 @@ class InterventionOrchestrator:
         attempts: list[dict[str, Any]],
         as_of: datetime,
         max_items: int = 5,
+        schedules: list[dict[str, Any]] | None = None,
     ) -> dict[str, Any]:
         if as_of.tzinfo is None or as_of.utcoffset() is None:
             raise ValueError("as_of must include a timezone offset")
@@ -468,14 +470,41 @@ class InterventionOrchestrator:
                 else []
             ),
         }
+        day_plan = (
+            build_day_plan(
+                queue_items=items,
+                schedules=list(schedules or []),
+                attempts=attempts,
+                project=self._project,
+                target=as_of.date(),
+                tzinfo=as_of.tzinfo,
+                now=as_of,
+            )
+            if items
+            else None
+        )
         return {
             "queue": queue,
-            "proposal": self._proposal(queue) if items else None,
+            "day_plan": day_plan,
+            "proposal": self._proposal(queue, day_plan) if items else None,
         }
 
     @staticmethod
-    def fingerprint(*, project: dict[str, Any], items: list[dict[str, Any]]) -> str:
-        """Hash only semantic fields, excluding clocks and explanatory prose."""
+    def fingerprint(
+        *,
+        project: dict[str, Any],
+        items: list[dict[str, Any]],
+        day_plan: dict[str, Any] | None = None,
+    ) -> str:
+        """Hash only semantic fields, excluding clocks and explanatory prose.
+
+        The day plan contributes its target date and its placed events, not its
+        derivation: two proposals for the same evidence but different days are
+        genuinely different proposals and must not collide on ``proposal_id``,
+        while re-deriving the same day from the same evidence must reproduce
+        the same id so a re-run is recognised as a duplicate rather than a
+        conflict.
+        """
 
         semantic_items = [
             {
@@ -494,11 +523,32 @@ class InterventionOrchestrator:
             }
             for item in items
         ]
+        # A day plan contributes to identity only once it actually places
+        # something. An empty plan schedules nothing, so letting its target
+        # date into the digest would make the same unchanged queue produce a
+        # new proposal every day -- the opposite of the idempotence that lets
+        # a repeated save be recognised as a duplicate.
+        placed = [
+            {
+                "id": event.get("id"),
+                "start": event.get("start"),
+                "end": event.get("end"),
+                "source_intervention_id": event.get("source_intervention_id"),
+            }
+            for entry in (day_plan or {}).get("schedules") or []
+            for event in entry.get("events") or []
+        ]
+        semantic_day_plan = (
+            {"target_date": (day_plan or {}).get("target_date"), "events": placed}
+            if placed
+            else None
+        )
         return _digest({
             "policy_version": INTERVENTION_POLICY_VERSION,
             "project_id": project["project_id"],
             "project_title": project.get("title"),
             "items": semantic_items,
+            "day_plan": semantic_day_plan,
         })
 
     @staticmethod
@@ -537,7 +587,11 @@ class InterventionOrchestrator:
             )
         return reasons
 
-    def _proposal(self, queue: dict[str, Any]) -> dict[str, Any]:
+    def _proposal(
+        self,
+        queue: dict[str, Any],
+        day_plan: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
         item_evidence = _unique([
             str(attempt_id)
             for item in queue["items"]
@@ -546,6 +600,7 @@ class InterventionOrchestrator:
         fingerprint = self.fingerprint(
             project=self._project,
             items=queue["items"],
+            day_plan=day_plan,
         )
         return {
             "schema_version": PLAN_PROPOSAL_SCHEMA_VERSION,
@@ -562,6 +617,7 @@ class InterventionOrchestrator:
             "created_at": queue["generated_at"],
             "as_of": queue["as_of"],
             "items": deepcopy(queue["items"]),
+            "day_plan": deepcopy(day_plan) if day_plan else None,
             "evidence_attempt_ids": item_evidence,
             "schedule_change": {
                 "state": "not_applied",

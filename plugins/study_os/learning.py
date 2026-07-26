@@ -448,6 +448,89 @@ def _validated_plan_proposal(path: Path) -> dict[str, Any]:
     return validated
 
 
+def _ensure_today_proposal(
+    vault: Path,
+    project: dict[str, Any],
+    args: dict[str, Any],
+    root: Path,
+) -> str:
+    """Return today's Plan Proposal, deriving and persisting it exactly once.
+
+    This is the seam both entry points share.  The desktop calls it when the
+    learner first opens StudyOS for the day and a cron job may call it earlier
+    as a nudge; whichever runs first persists, and the other one reads what is
+    already there.  Idempotence is by existence-of-a-proposed-plan-for-today
+    rather than by fingerprint: the day plan is anchored to the current time,
+    so re-deriving at 21:30 what was derived at 09:00 legitimately produces
+    different events and a different id, and without this check the learner
+    would collect a new proposal every time they opened the app.
+
+    A day already decided -- accepted or rejected -- is not regenerated.  The
+    learner has answered for today; proposing again would be nagging, not
+    planning.
+    """
+
+    as_of = parse_as_of(args.get("as_of"))
+    target = as_of.date().isoformat()
+    existing = [
+        proposal
+        for proposal in (_validated_plan_proposal(path) for path in sorted(root.glob("*.json")))
+        if (proposal.get("day_plan") or {}).get("target_date") == target
+    ]
+    decided = [item for item in existing if item.get("status") != "proposed"]
+    pending = [item for item in existing if item.get("status") == "proposed"]
+    if pending:
+        return legacy._ok(
+            {
+                "project_id": project["project_id"],
+                "proposal": pending[0],
+                "created": False,
+                "reason": "a proposed plan already exists for this date",
+            }
+        )
+    if decided:
+        return legacy._ok(
+            {
+                "project_id": project["project_id"],
+                "proposal": decided[0],
+                "created": False,
+                "reason": f"this date was already {decided[0].get('status')}",
+            }
+        )
+
+    orchestration = _intervention_orchestration(vault, project, dict(args))
+    proposal = orchestration.get("proposal")
+    if not proposal:
+        return legacy._ok(
+            {
+                "project_id": project["project_id"],
+                "proposal": None,
+                "created": False,
+                "reason": "the Intervention Queue is empty, so there is nothing to plan",
+            }
+        )
+    saved = json.loads(
+        _plan_proposal_activity(
+            "save",
+            {
+                "vault_path": str(vault),
+                "project_id": project["project_id"],
+                "proposal": proposal,
+            },
+        )
+    )
+    if not saved.get("ok"):
+        return json.dumps(saved, ensure_ascii=False)
+    return legacy._ok(
+        {
+            "project_id": project["project_id"],
+            "proposal": saved["data"]["proposal"],
+            "created": True,
+            "reason": "derived from current evidence",
+        }
+    )
+
+
 def _plan_proposal_activity(action: str, args: dict[str, Any]) -> str:
     vault = legacy.resolve_vault_path(args.get("vault_path"))
     project = _project(vault, args.get("project_id"))
@@ -479,6 +562,7 @@ def _plan_proposal_activity(action: str, args: dict[str, Any]) -> str:
         expected_fingerprint = InterventionOrchestrator.fingerprint(
             project=project,
             items=validated["items"],
+            day_plan=validated.get("day_plan"),
         )
         expected_proposal_id = f"plan-{expected_fingerprint[:20]}"
         if (
@@ -565,6 +649,9 @@ def _plan_proposal_activity(action: str, args: dict[str, Any]) -> str:
         if status:
             proposals = [proposal for proposal in proposals if proposal.get("status") == status]
         return legacy._ok({"project_id": project["project_id"], "proposals": proposals})
+
+    if action == "ensure_today":
+        return _ensure_today_proposal(vault, project, args, root)
 
     if action not in {"read", "accept", "reject"}:
         return legacy._err(
@@ -1042,6 +1129,33 @@ def _learning_runtime(vault: Path, project: dict[str, Any]) -> LearningRuntime:
     )
 
 
+def _project_schedules(vault: Path, project_id: str) -> list[dict[str, Any]]:
+    """Load a project's Schedules for day-plan projection.
+
+    Invalid files are skipped rather than raised: a day plan is a
+    recommendation, and one malformed Schedule should narrow it, not fail the
+    whole prioritisation. ``schedule.validate`` remains where a Schedule is
+    held to the contract.
+    """
+
+    root = (vault / ".StudyOS" / "projects" / legacy._validate_project_id(project_id) / "schedules").resolve()
+    try:
+        root.relative_to(vault)
+    except ValueError as exc:
+        raise ValueError("Schedule path escapes Vault") from exc
+    schedules: list[dict[str, Any]] = []
+    if not root.exists():
+        return schedules
+    for path in sorted(root.glob("*.json")):
+        try:
+            schedule = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            continue
+        if isinstance(schedule, dict):
+            schedules.append(schedule)
+    return schedules
+
+
 def _intervention_orchestration(
     vault: Path,
     project: dict[str, Any],
@@ -1057,6 +1171,7 @@ def _intervention_orchestration(
         attempts=_all_attempts(vault, project["project_id"]),
         as_of=as_of,
         max_items=max_items,
+        schedules=_project_schedules(vault, project["project_id"]),
     )
 
 
@@ -1376,7 +1491,7 @@ def _note_batch_tool_schema() -> dict[str, Any]:
 
 
 STUDY_ACTIVITY_SCHEMA = {
-    "description": "Single StudyOS persistence interface. For a StudyOS learning-planning request, first call project.status and prompt_context.load with planning or schedule_adjustment. Creating, completing, updating, registering, or adding a StudyOS plan requires schedule.validate followed by schedule.save; a Markdown file is only a draft and never completes persistence. Obsidian note writes must use note.validate then note.save, never a generic file-write tool: save is atomic and rejects every direct or transitively reachable dangling WikiLink until substantive notes for all missing targets are included in the batch. note.audit/graph reports existing WikiLink integrity; concept.graph remains the learning-dependency graph. Record/query immutable attempts and manage projects, notes, reviews, concepts, curricula, schedules, records, lessons, evidence-backed pattern proposals, and proactive Plan Proposals. For schedule.validate/save, data is the complete study_schedule.v1 object itself. Long-term date ranges belong in phases; phase.effort_minutes may hold aggregate workload, while events are optional concrete sessions and may be empty. schedule.save validates and writes the canonical file discovered by the StudyOS panel, so do not write or register a Schedule separately. plan_proposal supports save/list/read/accept/reject; accept records a decision but never mutates a Schedule. Cron sessions may save proposals but cannot decide them or save Schedules. For review.due, data supports explicit notes, subjects, YAML tags, concepts, difficulties, levels, review_state, match, sort, limit, and exclude_paths selectors; hidden directories are excluded by default, and limit never broadens the selectors. For a graded interactive review, prefer review.submit: it atomically stores the immutable attempt and advances spaced repetition. Put operation parameters in data.",
+    "description": "Single StudyOS persistence interface. For a StudyOS learning-planning request, first call project.status and prompt_context.load with planning or schedule_adjustment. Creating, completing, updating, registering, or adding a StudyOS plan requires schedule.validate followed by schedule.save; a Markdown file is only a draft and never completes persistence. Obsidian note writes must use note.validate then note.save, never a generic file-write tool: save is atomic and rejects every direct or transitively reachable dangling WikiLink until substantive notes for all missing targets are included in the batch. note.audit/graph reports existing WikiLink integrity; concept.graph remains the learning-dependency graph. Record/query immutable attempts and manage projects, notes, reviews, concepts, curricula, schedules, records, lessons, evidence-backed pattern proposals, and proactive Plan Proposals. For schedule.validate/save, data is the complete study_schedule.v1 object itself. Long-term date ranges belong in phases; phase.effort_minutes may hold aggregate workload, while events are optional concrete sessions and may be empty. schedule.save validates and writes the canonical file discovered by the StudyOS panel, so do not write or register a Schedule separately. plan_proposal supports ensure_today/save/list/read/accept/reject; ensure_today derives and persists the day's plan once and returns the existing one afterwards, and accept records a decision but never mutates a Schedule. Cron sessions may save proposals but cannot decide them or save Schedules. For review.due, data supports explicit notes, subjects, YAML tags, concepts, difficulties, levels, review_state, match, sort, limit, and exclude_paths selectors; hidden directories are excluded by default, and limit never broadens the selectors. For a graded interactive review, prefer review.submit: it atomically stores the immutable attempt and advances spaced repetition. Put operation parameters in data.",
     "parameters": {
         "type": "object",
         "properties": {

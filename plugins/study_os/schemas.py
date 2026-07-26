@@ -53,6 +53,7 @@ INTERVENTION_KINDS = {
     "retention_probe",
 }
 PLAN_PROPOSAL_STATUSES = {"proposed", "accepted", "rejected"}
+DAY_PLAN_SCHEMA_VERSION = "study_day_plan.v1"
 VERIFICATION_STATUSES = {"unobserved", "developing", "supported", "independent"}
 EVIDENCE_AGE_BANDS = {"unobserved", "fresh", "aging", "stale"}
 DEADLINE_BANDS = {"none", "distant", "approaching", "near", "critical", "overdue"}
@@ -356,6 +357,82 @@ def validate_pattern_proposal(data: Any) -> tuple[bool, dict[str, Any] | list[st
     _parse_datetime(proposal.get("created_at"), "created_at", errors)
     return (False, errors) if errors else (True, proposal)
 
+def _validate_day_plan(
+    day_plan: Any,
+    intervention_ids: set[str],
+    errors: list[str],
+) -> None:
+    """Validate the optional day-level projection carried by a proposal.
+
+    ``day_plan`` is absent on a proposal derived without Schedules, so None is
+    valid.  When present its events must be well formed and must each name an
+    Intervention the same proposal carries: an event whose provenance points
+    outside the proposal would put an unexplained block on the calendar, which
+    is exactly the "advice with no evidence" this module exists to prevent.
+    """
+
+    if day_plan is None:
+        return
+    plan = _require_mapping(day_plan, "day_plan", errors)
+    if plan is None:
+        return
+    if plan.get("schema_version") != DAY_PLAN_SCHEMA_VERSION:
+        errors.append(f"day_plan.schema_version must be {DAY_PLAN_SCHEMA_VERSION}")
+    target = plan.get("target_date")
+    if not isinstance(target, str) or not DATE_RE.match(target):
+        errors.append("day_plan.target_date must be an ISO date")
+    entries = plan.get("schedules")
+    if not isinstance(entries, list):
+        errors.append("day_plan.schedules must be an array")
+        return
+    seen_event_ids: set[str] = set()
+    for entry_index, entry in enumerate(entries):
+        entry_path = f"day_plan.schedules[{entry_index}]"
+        mapping = _require_mapping(entry, entry_path, errors)
+        if mapping is None:
+            continue
+        _require_string(mapping, "schedule_id", errors)
+        events = mapping.get("events")
+        if not isinstance(events, list):
+            errors.append(f"{entry_path}.events must be an array")
+            continue
+        for event_index, event in enumerate(events):
+            path = f"{entry_path}.events[{event_index}]"
+            event_map = _require_mapping(event, path, errors)
+            if event_map is None:
+                continue
+            for key in ("id", "title", "subject_id", "type", "status"):
+                if not isinstance(event_map.get(key), str) or not event_map[key].strip():
+                    errors.append(f"{path}.{key} must be a non-empty string")
+            event_id = event_map.get("id")
+            if isinstance(event_id, str):
+                if event_id in seen_event_ids:
+                    errors.append(f"{path}.id must be unique across the day plan")
+                seen_event_ids.add(event_id)
+            start = _parse_datetime(event_map.get("start"), f"{path}.start", errors)
+            end = _parse_datetime(event_map.get("end"), f"{path}.end", errors)
+            duration = event_map.get("duration_minutes")
+            if (
+                not isinstance(duration, int)
+                or isinstance(duration, bool)
+                or not 1 <= duration <= 720
+            ):
+                errors.append(f"{path}.duration_minutes must be an integer from 1 to 720")
+            elif start is not None and end is not None:
+                if end <= start:
+                    errors.append(f"{path}.end must be after start")
+                elif int((end - start).total_seconds() // 60) != duration:
+                    errors.append(f"{path}.duration_minutes does not match start/end")
+            _validate_string_array(event_map.get("goals"), f"{path}.goals", errors, non_empty=True)
+            source = event_map.get("source_intervention_id")
+            if not isinstance(source, str) or not source.strip():
+                errors.append(f"{path}.source_intervention_id must be a non-empty string")
+            elif intervention_ids and source not in intervention_ids:
+                errors.append(
+                    f"{path}.source_intervention_id must reference an Intervention in this proposal"
+                )
+
+
 def validate_plan_proposal(data: Any) -> tuple[bool, dict[str, Any] | list[str]]:
     """Validate a durable proposal derived from an Intervention Queue.
 
@@ -408,10 +485,10 @@ def validate_plan_proposal(data: Any) -> tuple[bool, dict[str, Any] | list[str]]
 
     items = proposal.get("items")
     item_evidence: list[str] = []
+    seen_intervention_ids: set[str] = set()
     if not isinstance(items, list) or not items:
         errors.append("items must be a non-empty array")
     else:
-        seen_intervention_ids: set[str] = set()
         for index, item in enumerate(items):
             path = f"items[{index}]"
             if not isinstance(item, dict):
@@ -506,6 +583,8 @@ def validate_plan_proposal(data: Any) -> tuple[bool, dict[str, Any] | list[str]]
 
     if set(item_evidence) != set(proposal_evidence):
         errors.append("evidence_attempt_ids must equal the union of item evidence_attempt_ids")
+
+    _validate_day_plan(proposal.get("day_plan"), seen_intervention_ids, errors)
 
     schedule_change = _require_mapping(proposal.get("schedule_change"), "schedule_change", errors)
     if schedule_change is not None:

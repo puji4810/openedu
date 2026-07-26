@@ -476,6 +476,41 @@ CATALOG: List[AutomationBlueprint] = [
         ],
         tags=("daily", "curiosity"),
     ),
+    AutomationBlueprint(
+        key="study-day-plan",
+        title="StudyOS daily plan",
+        description="Derive today's StudyOS plan from your evidence and leave "
+        "it in the Study inbox for you to accept or reject.",
+        category="daily",
+        schedule_template="{minute} {hour} * * *",
+        prompt_template=(
+            "Call study_activity with resource='plan_proposal' and "
+            "action='ensure_today' for the active StudyOS project in "
+            "{vault_path}. That single call derives today's plan from current "
+            "evidence and persists it, and returns the existing plan unchanged "
+            "if one was already created for today — so running it again is "
+            "safe and is not a reason to create a second plan.\n\n"
+            "Then report, in at most five lines: how many sessions it "
+            "proposes, the first one's time and capability, and anything it "
+            "reported as unplaced with the reason. If `created` is false, say "
+            "the plan already existed and do not restate it in full. If the "
+            "Intervention Queue was empty, say so and stop.\n\n"
+            "Do NOT accept or reject the plan and do NOT modify any Schedule: "
+            "a scheduled run may propose, but only the learner decides. If the "
+            "call fails, report the error code verbatim and stop."
+        ),
+        slots=[
+            BlueprintSlot(
+                name="vault_path", type="text",
+                label="Which Obsidian vault?",
+                help="Absolute path, e.g. /home/you/Math",
+            ),
+            _TIME("08:00"),
+            _DELIVER,
+        ],
+        skills=("study-os", "study-plan"),
+        tags=("daily", "study", "planning"),
+    ),
 ]
 
 _CATALOG_BY_KEY = {r.key: r for r in CATALOG}
