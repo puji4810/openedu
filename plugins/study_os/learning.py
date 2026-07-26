@@ -24,6 +24,7 @@ from plugins.study_os.activities import activity_adapter_for
 from plugins.study_os import tools as legacy
 from plugins.study_os.day_plan import active_phase
 from plugins.study_os.interventions import InterventionOrchestrator, parse_as_of
+from plugins.study_os.outcomes import build_intervention_outcomes
 from plugins.study_os.notes import StudyNoteCatalog
 from plugins.study_os.schemas import (
     ASSISTANCE_LEVELS,
@@ -1360,6 +1361,27 @@ def handle_study_coach(args: dict[str, Any], **_kwargs: Any) -> str:
             else:
                 output = runtime.finish(session_id=session_id)
             return legacy._ok({"project_id": project["project_id"], **output})
+        if action == "evaluate_interventions":
+            if scope != "project":
+                return legacy._err(
+                    "INVALID_SCOPE",
+                    "evaluate_interventions requires project scope so every decision is comparable",
+                )
+            root = _plan_proposal_dir(vault, project["project_id"])
+            proposals = [
+                _validated_plan_proposal(path) for path in sorted(root.glob("*.json"))
+            ]
+            return legacy._ok(
+                {
+                    "project_id": project["project_id"],
+                    "intervention_outcomes": build_intervention_outcomes(
+                        proposals=proposals,
+                        attempts=_all_attempts(vault, project["project_id"]),
+                        diagnosis_builder=_diagnosis,
+                        as_of=parse_as_of(data.get("as_of")),
+                    ),
+                }
+            )
         if action in {"prioritize", "propose_plan"}:
             if scope != "project":
                 return legacy._err(
@@ -1686,13 +1708,13 @@ STUDY_ACTIVITY_SCHEMA = {
 
 
 STUDY_COACH_SCHEMA = {
-    "description": "Evidence-driven StudyOS learning runtime and coach. Start, advance, inspect, or finish an explicit learning Session; diagnose attempts; summarize demonstrated change; recommend an intervention; prioritize a project-wide Intervention Queue; produce a read-only plan proposal; generate a diagnostic-probe blueprint; or propose a versioned problem-pattern improvement. Starting never creates evidence, advancing requires evaluator provenance, and proactive actions never persist or mutate a Schedule.",
+    "description": "Evidence-driven StudyOS learning runtime and coach. Start, advance, inspect, or finish an explicit learning Session; diagnose attempts; summarize demonstrated change; recommend an intervention; prioritize a project-wide Intervention Queue; produce a read-only plan proposal; evaluate whether accepted Interventions were followed by improvement; generate a diagnostic-probe blueprint; or propose a versioned problem-pattern improvement. Starting never creates evidence, advancing requires evaluator provenance, and proactive actions never persist or mutate a Schedule.",
     "parameters": {
         "type": "object",
         "properties": {
             "action": {
                 "type": "string",
-                "enum": ["start", "advance", "snapshot", "finish", "diagnose", "summarize", "recommend", "prioritize", "propose_plan", "generate_probe", "propose_pattern"],
+                "enum": ["start", "advance", "snapshot", "finish", "diagnose", "summarize", "recommend", "prioritize", "propose_plan", "evaluate_interventions", "generate_probe", "propose_pattern"],
                 "description": (
                     "start requires data.session_id and data.contract; advance requires data.session_id and "
                     "data.observation; snapshot/finish require data.session_id."

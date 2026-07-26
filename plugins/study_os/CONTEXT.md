@@ -21,6 +21,11 @@ concept projections. HTTP, overview, and model-tool adapters reuse this module
 instead of rebuilding selection rules. `StudyNoteCatalog` owns safe Vault note
 discovery and parsing underneath it; neither module expands the model schema.
 
+`outcomes.py` owns Intervention Outcome derivation. It stores nothing: an
+accepted Plan Proposal already records `decided_at` and the status each
+Intervention was reasoning about, so effectiveness is recomputed from attempts
+rather than tracked alongside them.
+
 `day_plan.py` owns the Day Plan projection: study-window derivation, event
 packing, per-phase budgets, and which Schedule an event belongs to. It is pure
 and writes nothing; `plan_proposal.apply` is the only path that turns its
@@ -94,6 +99,10 @@ _Avoid_: Generic advice, automatic schedule mutation
 **Intervention Queue**:
 A time-sensitive, derived ordering of the most valuable current Interventions across a Learning Project. It is a read model, not durable learning truth or a Schedule.
 _Avoid_: To-do list, fixed curriculum, mastery queue
+
+**Intervention Outcome**:
+A derived comparison between the verification status an accepted Intervention was reasoning about and the evidence recorded after its decision. An accepted Intervention with no later evidence is not-attempted, which is a statement about adherence and never about whether the recommendation was sound.
+_Avoid_: Success rate, mastery gain, intervention score
 
 **Plan Proposal**:
 A durable candidate that preserves selected Interventions and their evidence provenance for Learner review. Acceptance records a decision; applying it to a Schedule remains a separate explicit act.
