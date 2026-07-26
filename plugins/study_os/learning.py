@@ -22,6 +22,7 @@ from plugins.study_os.contract_models import (
 )
 from plugins.study_os.activities import activity_adapter_for
 from plugins.study_os import tools as legacy
+from plugins.study_os.day_plan import active_phase
 from plugins.study_os.interventions import InterventionOrchestrator, parse_as_of
 from plugins.study_os.notes import StudyNoteCatalog
 from plugins.study_os.schemas import (
@@ -531,6 +532,133 @@ def _ensure_today_proposal(
     )
 
 
+def _events_only_change(before: dict[str, Any], after: dict[str, Any]) -> bool:
+    """True when two Schedules differ in nothing but their ``events``.
+
+    Asserted rather than assumed. Applying a day plan is the one path that
+    writes a Schedule without the learner authoring it, so the guarantee that
+    it cannot touch phases, range, or title is worth enforcing structurally --
+    a future refactor that widened the merge would otherwise be silent.
+    """
+
+    return {key: value for key, value in before.items() if key != "events"} == {
+        key: value for key, value in after.items() if key != "events"
+    }
+
+
+def _apply_plan_proposal(
+    vault: Path,
+    project: dict[str, Any],
+    args: dict[str, Any],
+    root: Path,
+) -> str:
+    """Write an accepted proposal's day plan into its Schedules as events.
+
+    This is the third act of ADR-0003's derive / decide / apply, collapsed
+    from "read the Schedule, merge, validate, save" into one call for the
+    narrow case it can be made safe for: appending dated events that the
+    proposal already contains. It refuses anything else. Phases are never
+    touched, so accepting a day never silently rewrites the long-term plan.
+
+    Idempotent by event id: the day plan derives deterministic ids, so
+    re-applying replaces rather than duplicates.
+    """
+
+    proposal_id = legacy._validate_schedule_id(args.get("proposal_id"))
+    path = root / f"{proposal_id}.json"
+    if not path.exists():
+        return legacy._err("PROPOSAL_NOT_FOUND", f"Plan Proposal not found: {proposal_id}")
+    proposal = _validated_plan_proposal(path)
+    if proposal.get("status") != "accepted":
+        return legacy._err(
+            "PROPOSAL_NOT_ACCEPTED",
+            f"Only an accepted Plan Proposal may be applied; {proposal_id} is {proposal.get('status')}",
+        )
+
+    day_plan = proposal.get("day_plan") or {}
+    entries = [entry for entry in (day_plan.get("schedules") or []) if entry.get("events")]
+    if not entries:
+        return legacy._err(
+            "NOTHING_TO_APPLY",
+            "This Plan Proposal carries no day-plan events to write",
+        )
+    target = str(day_plan.get("target_date") or "")
+    try:
+        target_date = date.fromisoformat(target)
+    except ValueError:
+        return legacy._err("VALIDATION_FAILED", "day_plan.target_date must be an ISO date")
+
+    applied: list[dict[str, Any]] = []
+    for entry in entries:
+        schedule_id = str(entry.get("schedule_id") or "")
+        schedule_path = legacy._schedule_path(vault, project["project_id"], schedule_id)
+        if not schedule_path.exists():
+            return legacy._err(
+                "SCHEDULE_NOT_FOUND",
+                f"Plan Proposal targets a Schedule that no longer exists: {schedule_id}",
+            )
+        before = json.loads(schedule_path.read_text(encoding="utf-8"))
+        phase = active_phase(before, target_date)
+        if phase is None or str(phase.get("id")) != str(entry.get("phase_id")):
+            # The Schedule moved on since the plan was derived; writing the
+            # old events would attach them to a phase that no longer governs
+            # that day.
+            return legacy._err(
+                "PHASE_DRIFTED",
+                (
+                    f"Schedule {schedule_id} no longer has phase {entry.get('phase_id')} "
+                    f"covering {target}; re-derive the plan"
+                ),
+            )
+
+        merged = {
+            str(event.get("id")): event
+            for event in (before.get("events") or [])
+            if isinstance(event, dict)
+        }
+        for event in entry["events"]:
+            merged[str(event["id"])] = {
+                **event,
+                "source_plan_proposal_id": proposal_id,
+            }
+        after = {
+            **before,
+            "events": sorted(merged.values(), key=lambda item: (str(item.get("start")), str(item.get("id")))),
+        }
+        if not _events_only_change(before, after):
+            return legacy._err(
+                "APPLY_WOULD_CHANGE_MORE_THAN_EVENTS",
+                f"Refusing to write {schedule_id}: applying a day plan may only add events",
+            )
+        ok, validated = legacy._validate_schedule_for_project(after, project)
+        if not ok:
+            errors = validated if isinstance(validated, list) else ["Invalid Schedule"]
+            return legacy._err("VALIDATION_FAILED", "; ".join(errors), {"errors": errors})
+        legacy._write_text(schedule_path, legacy._json(validated))
+        applied.append(
+            {
+                "schedule_id": schedule_id,
+                "path": schedule_path.relative_to(vault).as_posix(),
+                "events_written": len(entry["events"]),
+                "events_total": len(validated["events"]),
+            }
+        )
+
+    return legacy._ok(
+        {
+            "project_id": project["project_id"],
+            "proposal_id": proposal_id,
+            "target_date": target,
+            "applied": applied,
+            "schedule_mutated": True,
+            "scope_policy": (
+                "Only events were written. Phases, range, and title are untouched, so "
+                "an applied day never rewrites the long-term plan."
+            ),
+        }
+    )
+
+
 def _plan_proposal_activity(action: str, args: dict[str, Any]) -> str:
     vault = legacy.resolve_vault_path(args.get("vault_path"))
     project = _project(vault, args.get("project_id"))
@@ -653,6 +781,9 @@ def _plan_proposal_activity(action: str, args: dict[str, Any]) -> str:
     if action == "ensure_today":
         return _ensure_today_proposal(vault, project, args, root)
 
+    if action == "apply":
+        return _apply_plan_proposal(vault, project, args, root)
+
     if action not in {"read", "accept", "reject"}:
         return legacy._err(
             "INVALID_ACTION",
@@ -715,8 +846,9 @@ def _plan_proposal_activity(action: str, args: dict[str, Any]) -> str:
             "changed": True,
             "schedule_mutated": False,
             "schedule_policy": (
-                "Acceptance records the learner decision only. To apply it, read the target Schedule, "
-                "include source_plan_proposal_id, then call schedule.validate and schedule.save explicitly."
+                "Acceptance records the learner decision only. Call plan_proposal.apply to write this "
+                "plan's events into their Schedules; it writes events and nothing else. A change to "
+                "phases or range remains a separate schedule.validate then schedule.save."
             ),
         }
     )
@@ -874,7 +1006,9 @@ def handle_study_activity(args: dict[str, Any], **_kwargs: Any) -> str:
             (resource == "schedule" and action == "save")
             or (
                 resource == "plan_proposal"
-                and action in {"accept", "reject"}
+                # ``apply`` writes events into a Schedule, so it belongs with
+                # the decisions a scheduled run may not make on its own.
+                and action in {"accept", "reject", "apply"}
             )
         ):
             return legacy._err(
@@ -1491,7 +1625,7 @@ def _note_batch_tool_schema() -> dict[str, Any]:
 
 
 STUDY_ACTIVITY_SCHEMA = {
-    "description": "Single StudyOS persistence interface. For a StudyOS learning-planning request, first call project.status and prompt_context.load with planning or schedule_adjustment. Creating, completing, updating, registering, or adding a StudyOS plan requires schedule.validate followed by schedule.save; a Markdown file is only a draft and never completes persistence. Obsidian note writes must use note.validate then note.save, never a generic file-write tool: save is atomic and rejects every direct or transitively reachable dangling WikiLink until substantive notes for all missing targets are included in the batch. note.audit/graph reports existing WikiLink integrity; concept.graph remains the learning-dependency graph. Record/query immutable attempts and manage projects, notes, reviews, concepts, curricula, schedules, records, lessons, evidence-backed pattern proposals, and proactive Plan Proposals. For schedule.validate/save, data is the complete study_schedule.v1 object itself. Long-term date ranges belong in phases; phase.effort_minutes may hold aggregate workload, while events are optional concrete sessions and may be empty. schedule.save validates and writes the canonical file discovered by the StudyOS panel, so do not write or register a Schedule separately. plan_proposal supports ensure_today/save/list/read/accept/reject; ensure_today derives and persists the day's plan once and returns the existing one afterwards, and accept records a decision but never mutates a Schedule. Cron sessions may save proposals but cannot decide them or save Schedules. For review.due, data supports explicit notes, subjects, YAML tags, concepts, difficulties, levels, review_state, match, sort, limit, and exclude_paths selectors; hidden directories are excluded by default, and limit never broadens the selectors. For a graded interactive review, prefer review.submit: it atomically stores the immutable attempt and advances spaced repetition. Put operation parameters in data.",
+    "description": "Single StudyOS persistence interface. For a StudyOS learning-planning request, first call project.status and prompt_context.load with planning or schedule_adjustment. Creating, completing, updating, registering, or adding a StudyOS plan requires schedule.validate followed by schedule.save; a Markdown file is only a draft and never completes persistence. Obsidian note writes must use note.validate then note.save, never a generic file-write tool: save is atomic and rejects every direct or transitively reachable dangling WikiLink until substantive notes for all missing targets are included in the batch. note.audit/graph reports existing WikiLink integrity; concept.graph remains the learning-dependency graph. Record/query immutable attempts and manage projects, notes, reviews, concepts, curricula, schedules, records, lessons, evidence-backed pattern proposals, and proactive Plan Proposals. For schedule.validate/save, data is the complete study_schedule.v1 object itself. Long-term date ranges belong in phases; phase.effort_minutes may hold aggregate workload, while events are optional concrete sessions and may be empty. schedule.save validates and writes the canonical file discovered by the StudyOS panel, so do not write or register a Schedule separately. plan_proposal supports ensure_today/save/list/read/accept/reject/apply; ensure_today derives and persists the day's plan once and returns the existing one afterwards, accept records a decision without mutating a Schedule, and apply then writes an accepted plan's events -- and only its events -- into their Schedules. Cron sessions may save proposals but cannot decide them or save Schedules. For review.due, data supports explicit notes, subjects, YAML tags, concepts, difficulties, levels, review_state, match, sort, limit, and exclude_paths selectors; hidden directories are excluded by default, and limit never broadens the selectors. For a graded interactive review, prefer review.submit: it atomically stores the immutable attempt and advances spaced repetition. Put operation parameters in data.",
     "parameters": {
         "type": "object",
         "properties": {

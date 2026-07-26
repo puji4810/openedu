@@ -30,9 +30,14 @@ platforms: [linux, macos, windows]
 
 ## Proposals
 
+`plan_proposal.ensure_today` derives and persists the day's plan once; call it
+at the first StudyOS interaction of a day rather than building one by hand, and
+do not create a second plan when it returns `created: false`.
+
 List pending proposals before saving one. Only an explicit learner decision
-permits accept/reject; apply an accepted proposal by validating and saving a
-Schedule that carries `source_plan_proposal_id`.
+permits accept/reject. Apply an accepted proposal with `plan_proposal.apply`,
+which writes its day-plan events and nothing else. Changing `phases` or `range`
+is still `schedule.validate` then `schedule.save`.
 <!-- prompt-context:end -->
 
 ## Reference

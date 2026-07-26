@@ -21,6 +21,11 @@ concept projections. HTTP, overview, and model-tool adapters reuse this module
 instead of rebuilding selection rules. `StudyNoteCatalog` owns safe Vault note
 discovery and parsing underneath it; neither module expands the model schema.
 
+`day_plan.py` owns the Day Plan projection: study-window derivation, event
+packing, per-phase budgets, and which Schedule an event belongs to. It is pure
+and writes nothing; `plan_proposal.apply` is the only path that turns its
+output into Schedule events, and it is restricted to events.
+
 `prompt_budget.py` owns Prompt Context Fragment budgeting: marked-region
 extraction, CJK-aware token estimation, and allocation of one shared pool
 across the `base`, `intent`, `domain`, and `project_summary` fragments in that
@@ -93,6 +98,10 @@ _Avoid_: To-do list, fixed curriculum, mastery queue
 **Plan Proposal**:
 A durable candidate that preserves selected Interventions and their evidence provenance for Learner review. Acceptance records a decision; applying it to a Schedule remains a separate explicit act.
 _Avoid_: Automatic plan, scheduled task, accepted Schedule
+
+**Day Plan**:
+A projection of the Intervention Queue onto one date's concrete events, placed inside a study window derived from the Learner's own timestamped attempts and bounded by the covering phase's remaining effort. It is carried on a Plan Proposal; applying it writes events and never phases.
+_Avoid_: Schedule, to-do list, fixed timetable
 
 **Source Anchor**:
 A version-aware reference to the exact source location supporting an Activity or claim.

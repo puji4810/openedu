@@ -263,20 +263,50 @@ class StudyOSApplication:
             raise StudyApplicationError(400, "action must be accept or reject")
         workspace = self._workspace()
         assert workspace is not None
-        return self._tool_data(
+        project_id = str(params.get("project_id") or "")
+        proposal_id = str(params.get("proposal_id") or "")
+        decided = self._tool_data(
             handle_study_activity(
                 {
                     "resource": "plan_proposal",
                     "action": action,
                     "vault_path": str(workspace.vault),
-                    "project_id": str(params.get("project_id") or ""),
+                    "project_id": project_id,
                     "data": {
-                        "proposal_id": str(params.get("proposal_id") or ""),
+                        "proposal_id": proposal_id,
                         "decision_note": params.get("decision_note"),
                     },
                 }
             )
         )
+        if action != "accept" or not params.get("apply"):
+            return decided
+
+        # Accepting a day plan and not seeing it on the calendar would be
+        # baffling, so the UI may ask for both in one round trip. The write is
+        # still the restricted events-only apply, and a failure here leaves the
+        # decision standing rather than pretending the whole call failed.
+        raw = handle_study_activity(
+            {
+                "resource": "plan_proposal",
+                "action": "apply",
+                "vault_path": str(workspace.vault),
+                "project_id": project_id,
+                "data": {"proposal_id": proposal_id},
+            }
+        )
+        envelope = json.loads(raw)
+        if envelope.get("ok"):
+            return {**decided, "applied": envelope["data"]["applied"], "schedule_mutated": True}
+        error = envelope.get("error") or {}
+        return {
+            **decided,
+            "applied": [],
+            "apply_error": {
+                "code": str(error.get("code") or "STUDY_OPERATION_FAILED"),
+                "message": str(error.get("message") or ""),
+            },
+        }
 
     def _project(self, project_id: str) -> dict[str, Any]:
         workspace = self._workspace()

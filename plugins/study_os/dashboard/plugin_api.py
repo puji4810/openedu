@@ -100,6 +100,9 @@ async def get_study_overview(
 class StudyPlanProposalDecision(BaseModel):
     action: str
     decision_note: Optional[str] = None
+    # Accepting a day plan normally means "put it on my calendar"; the flag
+    # stays explicit so the decide/apply seam is not blurred for other callers.
+    apply: bool = False
 
 
 @router.put("/projects/{project_id}/plan-proposals/{proposal_id}")
@@ -114,6 +117,7 @@ async def put_study_plan_proposal_decision(
         proposal_id=proposal_id,
         action=body.action,
         decision_note=body.decision_note,
+        apply=body.apply,
     )
 
 

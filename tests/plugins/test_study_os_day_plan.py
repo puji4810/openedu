@@ -587,3 +587,217 @@ def test_study_day_plan_blueprint_is_registered_and_fills():
     assert "/home/learner/Math" in filled["prompt"]
     # A scheduled run proposes; it must never be told it may decide.
     assert "only the learner decides" in filled["prompt"]
+
+
+# ── apply ─────────────────────────────────────────────────────────────────
+
+
+def _activity(vault, action, data, **kwargs):
+    import json as _json
+
+    from plugins.study_os.learning import handle_study_activity
+
+    return _json.loads(
+        handle_study_activity(
+            {
+                "vault_path": str(vault),
+                "resource": "plan_proposal",
+                "action": action,
+                "project_id": "plan-project",
+                "data": data,
+            },
+            **kwargs,
+        )
+    )
+
+
+def _accepted_proposal(vault, when="2026-07-26T09:00:00+08:00"):
+    proposal = _ensure(vault, when)["data"]["proposal"]
+    accepted = _activity(vault, "accept", {"proposal_id": proposal["proposal_id"]})
+    assert accepted["ok"], accepted
+    return proposal
+
+
+def _schedule_file(vault):
+    return vault / ".StudyOS" / "projects" / "plan-project" / "schedules" / "alpha-track.json"
+
+
+def test_apply_refuses_a_proposal_that_was_not_accepted(planned_vault):
+    proposal = _ensure(planned_vault, "2026-07-26T09:00:00+08:00")["data"]["proposal"]
+
+    result = _activity(planned_vault, "apply", {"proposal_id": proposal["proposal_id"]})
+
+    assert result["error"]["code"] == "PROPOSAL_NOT_ACCEPTED"
+
+
+def test_apply_writes_the_day_plan_events_into_the_schedule(planned_vault):
+    import json as _json
+
+    proposal = _accepted_proposal(planned_vault)
+
+    result = _activity(planned_vault, "apply", {"proposal_id": proposal["proposal_id"]})
+
+    assert result["ok"], result
+    assert result["data"]["schedule_mutated"] is True
+    schedule = _json.loads(_schedule_file(planned_vault).read_text(encoding="utf-8"))
+    assert schedule["events"]
+    assert all(
+        event["source_plan_proposal_id"] == proposal["proposal_id"]
+        for event in schedule["events"]
+    )
+
+
+def test_apply_changes_events_and_nothing_else(planned_vault):
+    import json as _json
+
+    before = _json.loads(_schedule_file(planned_vault).read_text(encoding="utf-8"))
+    proposal = _accepted_proposal(planned_vault)
+
+    _activity(planned_vault, "apply", {"proposal_id": proposal["proposal_id"]})
+
+    after = _json.loads(_schedule_file(planned_vault).read_text(encoding="utf-8"))
+    assert {k: v for k, v in before.items() if k != "events"} == {
+        k: v for k, v in after.items() if k != "events"
+    }
+
+
+def test_apply_is_idempotent(planned_vault):
+    import json as _json
+
+    proposal = _accepted_proposal(planned_vault)
+
+    first = _activity(planned_vault, "apply", {"proposal_id": proposal["proposal_id"]})
+    second = _activity(planned_vault, "apply", {"proposal_id": proposal["proposal_id"]})
+
+    assert first["data"]["applied"][0]["events_total"] == (
+        second["data"]["applied"][0]["events_total"]
+    )
+    schedule = _json.loads(_schedule_file(planned_vault).read_text(encoding="utf-8"))
+    ids = [event["id"] for event in schedule["events"]]
+    assert len(ids) == len(set(ids))
+
+
+def test_apply_refuses_when_the_phase_moved_since_the_plan_was_derived(planned_vault):
+    import json as _json
+
+    proposal = _accepted_proposal(planned_vault)
+    path = _schedule_file(planned_vault)
+    schedule = _json.loads(path.read_text(encoding="utf-8"))
+    schedule["phases"][0]["id"] = "renamed"
+    path.write_text(_json.dumps(schedule, ensure_ascii=False), encoding="utf-8")
+
+    result = _activity(planned_vault, "apply", {"proposal_id": proposal["proposal_id"]})
+
+    assert result["error"]["code"] == "PHASE_DRIFTED"
+
+
+def test_apply_surfaces_the_events_to_the_desktop_overview(planned_vault):
+    from plugins.study_os.overview import build_study_overview
+    from plugins.study_os.workspace import StudyWorkspace
+
+    workspace = StudyWorkspace(vault=planned_vault, source="test")
+    before = build_study_overview(
+        workspace, project_id="plan-project", as_of="2026-07-26T10:00:00+08:00"
+    )
+    assert before["today_events"] == []
+
+    proposal = _accepted_proposal(planned_vault)
+    _activity(planned_vault, "apply", {"proposal_id": proposal["proposal_id"]})
+
+    after = build_study_overview(
+        workspace, project_id="plan-project", as_of="2026-07-26T10:00:00+08:00"
+    )
+    assert len(after["today_events"]) == len(
+        proposal["day_plan"]["schedules"][0]["events"]
+    )
+
+
+def test_cron_may_propose_but_may_not_apply(planned_vault):
+    proposal = _accepted_proposal(planned_vault)
+
+    result = _activity(
+        planned_vault,
+        "apply",
+        {"proposal_id": proposal["proposal_id"]},
+        session_id="cron_daily",
+    )
+
+    assert result["error"]["code"] == "CRON_PROPOSAL_ONLY"
+
+
+def test_desktop_accept_can_apply_in_one_round_trip(planned_vault, monkeypatch):
+    """The Accept button should land the plan on the calendar, not just record a decision."""
+
+    from plugins.study_os.application import StudyCommand, StudyOSApplication, StudyQuery
+
+    monkeypatch.setenv("OBSIDIAN_VAULT_PATH", str(planned_vault))
+    proposal = _ensure(planned_vault, "2026-07-26T09:00:00+08:00")["data"]["proposal"]
+    application = StudyOSApplication()
+
+    before = application.query(
+        StudyQuery.OVERVIEW, project_id="plan-project", as_of="2026-07-26T10:00:00+08:00"
+    )
+    result = application.execute(
+        StudyCommand.DECIDE_PLAN_PROPOSAL,
+        project_id="plan-project",
+        proposal_id=proposal["proposal_id"],
+        action="accept",
+        apply=True,
+    )
+    after = application.query(
+        StudyQuery.OVERVIEW, project_id="plan-project", as_of="2026-07-26T10:00:00+08:00"
+    )
+
+    assert before["today_events"] == []
+    assert result["proposal"]["status"] == "accepted"
+    assert result["schedule_mutated"] is True
+    assert after["today_events"]
+
+
+def test_desktop_accept_without_apply_leaves_the_schedule_alone(planned_vault, monkeypatch):
+    from plugins.study_os.application import StudyCommand, StudyOSApplication, StudyQuery
+
+    monkeypatch.setenv("OBSIDIAN_VAULT_PATH", str(planned_vault))
+    proposal = _ensure(planned_vault, "2026-07-26T09:00:00+08:00")["data"]["proposal"]
+    application = StudyOSApplication()
+
+    result = application.execute(
+        StudyCommand.DECIDE_PLAN_PROPOSAL,
+        project_id="plan-project",
+        proposal_id=proposal["proposal_id"],
+        action="accept",
+    )
+    after = application.query(
+        StudyQuery.OVERVIEW, project_id="plan-project", as_of="2026-07-26T10:00:00+08:00"
+    )
+
+    assert result["proposal"]["status"] == "accepted"
+    assert "applied" not in result
+    assert after["today_events"] == []
+
+
+def test_desktop_apply_failure_still_reports_the_recorded_decision(planned_vault, monkeypatch):
+    """A drifted phase must not make an accepted decision look like a failure."""
+
+    import json as _json
+
+    from plugins.study_os.application import StudyCommand, StudyOSApplication
+
+    monkeypatch.setenv("OBSIDIAN_VAULT_PATH", str(planned_vault))
+    proposal = _ensure(planned_vault, "2026-07-26T09:00:00+08:00")["data"]["proposal"]
+    path = _schedule_file(planned_vault)
+    schedule = _json.loads(path.read_text(encoding="utf-8"))
+    schedule["phases"][0]["id"] = "renamed"
+    path.write_text(_json.dumps(schedule, ensure_ascii=False), encoding="utf-8")
+
+    result = StudyOSApplication().execute(
+        StudyCommand.DECIDE_PLAN_PROPOSAL,
+        project_id="plan-project",
+        proposal_id=proposal["proposal_id"],
+        action="accept",
+        apply=True,
+    )
+
+    assert result["proposal"]["status"] == "accepted"
+    assert result["applied"] == []
+    assert result["apply_error"]["code"] == "PHASE_DRIFTED"
