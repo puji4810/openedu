@@ -248,6 +248,7 @@ def build_day_plan(
     target: date,
     tzinfo: ZoneInfo,
     now: datetime | None = None,
+    capacity: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Lay the queue out over *target* inside the learner's study window.
 
@@ -261,9 +262,17 @@ def build_day_plan(
     learner sits down, which is usually part-way through their own study
     window, so anchoring on the window start alone would propose a morning of
     sessions to someone opening the app at night.
+
+    ``capacity`` is the measured share of a planned day this learner actually
+    completes, from :func:`plugins.study_os.calibration.capacity_factor`.  A
+    phase budget states intent; a plan that has never once been finished states
+    what fits.  Absent or unmeasured, the nominal budget stands.
     """
 
     window = study_window(attempts, tzinfo=tzinfo)
+    factor = capacity.get("factor") if isinstance(capacity, dict) else None
+    if not isinstance(factor, (int, float)) or isinstance(factor, bool) or not 0 < factor <= 1:
+        factor = 1.0
     day_start = datetime(
         target.year, target.month, target.day, window["start_hour"], tzinfo=tzinfo
     )
@@ -294,6 +303,7 @@ def build_day_plan(
             "target_date": target.isoformat(),
             "timezone": str(tzinfo),
             "study_window": window,
+            "capacity": capacity if isinstance(capacity, dict) else None,
             "minutes_planned": 0,
             "schedules": [],
             "unplaced": [
@@ -310,6 +320,11 @@ def build_day_plan(
         entry["spent"] = 0
         if entry["budget"] is None:
             entry["budget"] = window_minutes
+        entry["nominal_budget"] = entry["budget"]
+        # At least one minute survives the factor: a day whose budget rounds to
+        # zero would report every Intervention as unplaced for a reason the
+        # learner cannot act on.
+        entry["budget"] = max(1, int(entry["budget"] * factor))
 
     # One learner, one clock: the cursor is global so events from parallel
     # Schedules cannot be proposed for the same minute. Budgets stay per
@@ -391,7 +406,9 @@ def build_day_plan(
         "target_date": target.isoformat(),
         "timezone": str(tzinfo),
         "study_window": window,
+        "capacity": capacity if isinstance(capacity, dict) else None,
         "minutes_budget": sum(entry["budget"] for entry in targets),
+        "minutes_budget_nominal": sum(entry["nominal_budget"] for entry in targets),
         "minutes_planned": spent,
         "schedules": [
             {
@@ -400,6 +417,7 @@ def build_day_plan(
                 "phase_id": str(entry["phase"].get("id") or ""),
                 "phase_goal": str(entry["phase"].get("goal") or ""),
                 "minutes_budget": entry["budget"],
+                "minutes_budget_nominal": entry["nominal_budget"],
                 "minutes_planned": entry["spent"],
                 "events": entry["events"],
             }

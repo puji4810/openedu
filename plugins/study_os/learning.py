@@ -22,6 +22,12 @@ from plugins.study_os.contract_models import (
 )
 from plugins.study_os.activities import activity_adapter_for
 from plugins.study_os import tools as legacy
+from plugins.study_os.adherence import DEFAULT_LOOKBACK_DAYS, build_plan_adherence
+from plugins.study_os.calibration import (
+    OUTCOME_LOOKBACK_DAYS,
+    capacity_factor,
+    outcome_adjustment,
+)
 from plugins.study_os.day_plan import active_phase
 from plugins.study_os.interventions import InterventionOrchestrator, parse_as_of
 from plugins.study_os.outcomes import build_intervention_outcomes
@@ -433,9 +439,17 @@ def _proposal_activity(action: str, args: dict[str, Any]) -> str:
     return legacy._err("INVALID_ACTION", f"Unsupported pattern_proposal action: {action}")
 
 
-def _plan_proposal_dir(vault: Path, project_id: str) -> Path:
+def _plan_proposal_dir(vault: Path, project_id: str, *, create: bool = True) -> Path:
+    """Where a project's Plan Proposals live.
+
+    ``create=False`` for the read-only paths.  Deriving a proposal must leave
+    no trace until the learner saves one, and a directory appearing on disk is
+    a trace: the tests hold ``propose_plan`` to exactly that.
+    """
+
     path = legacy._project_dir(vault, project_id) / "plan-proposals"
-    path.mkdir(parents=True, exist_ok=True)
+    if create:
+        path.mkdir(parents=True, exist_ok=True)
     return path
 
 
@@ -1316,22 +1330,121 @@ def _project_schedules(vault: Path, project_id: str) -> list[dict[str, Any]]:
     return schedules
 
 
+def _project_timezone(project: dict[str, Any], fallback: datetime) -> Any:
+    """The project's own clock, or the caller's when it declares none."""
+
+    name = project.get("timezone")
+    if not isinstance(name, str) or not name.strip():
+        return fallback.tzinfo
+    try:
+        return ZoneInfo(name.strip())
+    except ZoneInfoNotFoundError as exc:
+        raise ValueError(
+            f"project timezone is not a valid IANA timezone: {name}"
+        ) from exc
+
+
+def _readable_plan_proposals(root: Path) -> list[dict[str, Any]]:
+    """Every Plan Proposal that still validates, skipping the ones that do not.
+
+    Deliberately more forgiving than ``plan_proposal.read``: these proposals
+    are read to measure the recommender's own history, and one unreadable file
+    should narrow that history rather than block the learner from getting a
+    plan today.
+    """
+
+    if not root.is_dir():
+        return []
+    proposals: list[dict[str, Any]] = []
+    for path in sorted(root.glob("*.json")):
+        try:
+            proposals.append(_validated_plan_proposal(path))
+        except (ValueError, OSError, json.JSONDecodeError):
+            continue
+    return proposals
+
+
+def _recent_outcomes(
+    vault: Path,
+    project: dict[str, Any],
+    attempts: list[dict[str, Any]],
+    as_of: datetime,
+) -> dict[str, Any]:
+    """Measured effectiveness of decisions recent enough to still describe now."""
+
+    horizon = as_of - timedelta(days=OUTCOME_LOOKBACK_DAYS)
+    proposals = [
+        proposal
+        for proposal in _readable_plan_proposals(
+            _plan_proposal_dir(vault, project["project_id"], create=False)
+        )
+        if _decided_after(proposal, horizon)
+    ]
+    return build_intervention_outcomes(
+        proposals=proposals,
+        attempts=attempts,
+        diagnosis_builder=_diagnosis,
+        as_of=as_of,
+    )
+
+
+def _decided_after(proposal: dict[str, Any], horizon: datetime) -> bool:
+    decided = (proposal.get("decision") or {}).get("decided_at")
+    if not isinstance(decided, str):
+        return False
+    try:
+        moment = datetime.fromisoformat(decided.replace("Z", "+00:00"))
+    except ValueError:
+        return False
+    return moment.tzinfo is not None and moment >= horizon
+
+
+def _recent_adherence(
+    project: dict[str, Any],
+    schedules: list[dict[str, Any]],
+    attempts: list[dict[str, Any]],
+    as_of: datetime,
+    lookback_days: int = DEFAULT_LOOKBACK_DAYS,
+) -> dict[str, Any]:
+    tzinfo = _project_timezone(project, as_of)
+    end = as_of.astimezone(tzinfo).date()
+    return build_plan_adherence(
+        schedules=schedules,
+        attempts=attempts,
+        tzinfo=tzinfo,
+        start=end - timedelta(days=lookback_days),
+        end=end,
+        as_of=as_of,
+    )
+
+
 def _intervention_orchestration(
     vault: Path,
     project: dict[str, Any],
     data: dict[str, Any],
 ) -> dict[str, Any]:
+    """Derive the queue with the recommender's own measured history in hand.
+
+    Both corrections are read here rather than inside the orchestrator: the
+    orchestrator stays pure and testable on data alone, while this seam owns
+    the Vault reads that produce that data.
+    """
+
     max_items = data.get("max_items", 5)
     as_of = parse_as_of(data.get("as_of"))
+    attempts = _all_attempts(vault, project["project_id"])
+    schedules = _project_schedules(vault, project["project_id"])
     orchestrator = InterventionOrchestrator(
         project=project,
         diagnosis_builder=_diagnosis,
     )
     return orchestrator.build(
-        attempts=_all_attempts(vault, project["project_id"]),
+        attempts=attempts,
         as_of=as_of,
         max_items=max_items,
-        schedules=_project_schedules(vault, project["project_id"]),
+        schedules=schedules,
+        outcomes=_recent_outcomes(vault, project, attempts, as_of),
+        adherence=_recent_adherence(project, schedules, attempts, as_of),
     )
 
 
@@ -1361,6 +1474,50 @@ def handle_study_coach(args: dict[str, Any], **_kwargs: Any) -> str:
             else:
                 output = runtime.finish(session_id=session_id)
             return legacy._ok({"project_id": project["project_id"], **output})
+        if action == "evaluate_adherence":
+            if scope != "project":
+                return legacy._err(
+                    "INVALID_SCOPE",
+                    "evaluate_adherence requires project scope so every applied plan is read on one clock",
+                )
+            as_of = parse_as_of(data.get("as_of"))
+            tzinfo = _project_timezone(project, as_of)
+            end = as_of.astimezone(tzinfo).date()
+            try:
+                if data.get("end_date"):
+                    end = date.fromisoformat(str(data["end_date"]))
+                start = (
+                    date.fromisoformat(str(data["start_date"]))
+                    if data.get("start_date")
+                    else end - timedelta(days=DEFAULT_LOOKBACK_DAYS)
+                )
+            except ValueError:
+                return legacy._err(
+                    "VALIDATION_FAILED",
+                    "start_date and end_date must be ISO dates (YYYY-MM-DD)",
+                )
+            if start > end:
+                return legacy._err("VALIDATION_FAILED", "start_date must not follow end_date")
+            attempts = _all_attempts(vault, project["project_id"])
+            adherence = build_plan_adherence(
+                schedules=_project_schedules(vault, project["project_id"]),
+                attempts=attempts,
+                tzinfo=tzinfo,
+                start=start,
+                end=end,
+                as_of=as_of,
+            )
+            return legacy._ok(
+                {
+                    "project_id": project["project_id"],
+                    "plan_adherence": adherence,
+                    # The correction this measurement produces, shown next to
+                    # it: an adherence report the learner cannot connect to
+                    # tomorrow's plan is the open loop this action exists to
+                    # close.
+                    "capacity": capacity_factor(adherence),
+                }
+            )
         if action == "evaluate_interventions":
             if scope != "project":
                 return legacy._err(
@@ -1371,15 +1528,27 @@ def handle_study_coach(args: dict[str, Any], **_kwargs: Any) -> str:
             proposals = [
                 _validated_plan_proposal(path) for path in sorted(root.glob("*.json"))
             ]
+            outcomes = build_intervention_outcomes(
+                proposals=proposals,
+                attempts=_all_attempts(vault, project["project_id"]),
+                diagnosis_builder=_diagnosis,
+                as_of=parse_as_of(data.get("as_of")),
+            )
             return legacy._ok(
                 {
                     "project_id": project["project_id"],
-                    "intervention_outcomes": build_intervention_outcomes(
-                        proposals=proposals,
-                        attempts=_all_attempts(vault, project["project_id"]),
-                        diagnosis_builder=_diagnosis,
-                        as_of=parse_as_of(data.get("as_of")),
-                    ),
+                    "intervention_outcomes": outcomes,
+                    # What this measurement changes, next to what it measured:
+                    # the priority delta each kind now carries into the queue.
+                    "calibration": [
+                        {
+                            "kind": row["kind"],
+                            **outcome_adjustment(
+                                by_kind=outcomes["by_kind"], kind=row["kind"]
+                            ),
+                        }
+                        for row in outcomes["by_kind"]
+                    ],
                 }
             )
         if action in {"prioritize", "propose_plan"}:
@@ -1708,13 +1877,13 @@ STUDY_ACTIVITY_SCHEMA = {
 
 
 STUDY_COACH_SCHEMA = {
-    "description": "Evidence-driven StudyOS learning runtime and coach. Start, advance, inspect, or finish an explicit learning Session; diagnose attempts; summarize demonstrated change; recommend an intervention; prioritize a project-wide Intervention Queue; produce a read-only plan proposal; evaluate whether accepted Interventions were followed by improvement; generate a diagnostic-probe blueprint; or propose a versioned problem-pattern improvement. Starting never creates evidence, advancing requires evaluator provenance, and proactive actions never persist or mutate a Schedule.",
+    "description": "Evidence-driven StudyOS learning runtime and coach. Start, advance, inspect, or finish an explicit learning Session; diagnose attempts; summarize demonstrated change; recommend an intervention; prioritize a project-wide Intervention Queue; produce a read-only plan proposal; evaluate whether accepted Interventions were followed by improvement; evaluate whether applied day-plan events actually happened; generate a diagnostic-probe blueprint; or propose a versioned problem-pattern improvement. prioritize and propose_plan already apply what those two evaluations measure -- observed activity duration, measured effectiveness, and completed share of a planned day -- so call evaluate_adherence or evaluate_interventions to explain a plan, not to obtain one. Starting never creates evidence, advancing requires evaluator provenance, and proactive actions never persist or mutate a Schedule.",
     "parameters": {
         "type": "object",
         "properties": {
             "action": {
                 "type": "string",
-                "enum": ["start", "advance", "snapshot", "finish", "diagnose", "summarize", "recommend", "prioritize", "propose_plan", "evaluate_interventions", "generate_probe", "propose_pattern"],
+                "enum": ["start", "advance", "snapshot", "finish", "diagnose", "summarize", "recommend", "prioritize", "propose_plan", "evaluate_interventions", "evaluate_adherence", "generate_probe", "propose_pattern"],
                 "description": (
                     "start requires data.session_id and data.contract; advance requires data.session_id and "
                     "data.observation; snapshot/finish require data.session_id."
@@ -1725,7 +1894,7 @@ STUDY_COACH_SCHEMA = {
             "project_id": study_project_id_json_schema(),
             "data": {
                 "type": "object",
-                "description": "For lifecycle actions: session_id plus contract (start) or evaluated observation (advance). For evidence analysis: concept, pattern, item_id, result, start_date, or end_date filters. For prioritize/propose_plan: optional timezone-aware as_of and max_items (1-20).",
+                "description": "For lifecycle actions: session_id plus contract (start) or evaluated observation (advance). For evidence analysis: concept, pattern, item_id, result, start_date, or end_date filters. For prioritize/propose_plan: optional timezone-aware as_of and max_items (1-20). For evaluate_adherence: optional start_date/end_date bounding which applied days are reconciled, defaulting to the last two weeks.",
                 "properties": {
                     "session_id": {
                         "type": "string",

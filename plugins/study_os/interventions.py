@@ -16,6 +16,11 @@ from datetime import date, datetime
 from typing import Any
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
+from plugins.study_os.calibration import (
+    calibrated_duration,
+    capacity_factor,
+    outcome_adjustment,
+)
 from plugins.study_os.day_plan import build_day_plan
 from plugins.study_os.domain_packs import domain_pack_for
 from plugins.study_os.schemas import (
@@ -175,8 +180,18 @@ def _priority_band(score: int) -> str:
     return "low"
 
 
-def _duration_minutes(project: dict[str, Any]) -> int:
-    return domain_pack_for(project).intervention_duration
+def _duration_for(
+    project: dict[str, Any],
+    attempts: list[dict[str, Any]],
+    kind: str,
+) -> dict[str, Any]:
+    """The Domain Pack's stated duration, corrected by observed evidence."""
+
+    return calibrated_duration(
+        attempts=attempts,
+        kind=kind,
+        default_minutes=domain_pack_for(project).intervention_duration,
+    )
 
 
 def _assistance_for(kind: str) -> str:
@@ -310,7 +325,18 @@ class InterventionOrchestrator:
         as_of: datetime,
         max_items: int = 5,
         schedules: list[dict[str, Any]] | None = None,
+        outcomes: dict[str, Any] | None = None,
+        adherence: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
+        """Derive the queue, optionally corrected by its own measured history.
+
+        ``outcomes`` and ``adherence`` are the recommender's record of itself,
+        from :mod:`plugins.study_os.outcomes` and
+        :mod:`plugins.study_os.adherence`.  Both are optional and both degrade
+        to no correction when the sample is too thin, so a new project derives
+        exactly the queue it derived before this feedback existed.
+        """
+
         if as_of.tzinfo is None or as_of.utcoffset() is None:
             raise ValueError("as_of must include a timezone offset")
         as_of = _in_project_timezone(self._project, as_of)
@@ -402,7 +428,15 @@ class InterventionOrchestrator:
                 )
                 if verification_status == "developing" and repeated_count:
                     score += min(12, repeated_count * 3)
-                score = min(100, score)
+                # The recommender's own record, applied last so the evidence
+                # about the learner decides the score and the evidence about
+                # the advice only adjusts it.
+                adjustment = outcome_adjustment(
+                    by_kind=(outcomes or {}).get("by_kind"), kind=kind
+                )
+                score += adjustment["delta"]
+                score = max(0, min(100, score))
+                duration = _duration_for(self._project, attempts, kind)
 
                 reasons = self._reasons(
                     verification_status=verification_status,
@@ -413,6 +447,12 @@ class InterventionOrchestrator:
                     days_to_deadline=days_to_deadline,
                     repeated_cluster=repeated_cluster,
                 )
+                if adjustment["delta"]:
+                    reasons.append(
+                        f"{kind.replace('_', ' ')} has improved this project's evidence in "
+                        f"{int(round(adjustment['improvement_rate'] * 100))}% of the "
+                        f"{adjustment['sample_size']} times it was acted on."
+                    )
                 semantic_key = {
                     "project_id": self._project["project_id"],
                     "objective_id": objective["objective_id"],
@@ -440,6 +480,10 @@ class InterventionOrchestrator:
                         "days_to_deadline": days_to_deadline,
                         "deadline_band": deadline_band,
                         "repeated_diagnosis_count": repeated_count,
+                        "outcome_adjustment": adjustment["delta"],
+                        "outcome_improvement_rate": adjustment["improvement_rate"],
+                        "outcome_sample_size": adjustment["sample_size"],
+                        "outcome_source": adjustment["source"],
                     },
                     "latest_evidence_at": latest_evidence_at,
                     "evidence_attempt_ids": evidence_ids,
@@ -447,7 +491,9 @@ class InterventionOrchestrator:
                         "activity_kind": kind,
                         "evidence_target": target,
                         "assistance_level": _assistance_for(kind),
-                        "duration_minutes": _duration_minutes(self._project),
+                        "duration_minutes": duration["minutes"],
+                        "duration_source": duration["source"],
+                        "duration_sample_size": duration["sample_size"],
                         "requires_evaluator": True,
                         "success_criteria": list(objective.get("success_criteria", [])),
                         "source_anchors": list(objective.get("source_anchors", [])),
@@ -517,6 +563,7 @@ class InterventionOrchestrator:
                 target=as_of.date(),
                 tzinfo=as_of.tzinfo,
                 now=as_of,
+                capacity=capacity_factor(adherence),
             )
             if items
             else None

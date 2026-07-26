@@ -26,10 +26,29 @@ accepted Plan Proposal already records `decided_at` and the status each
 Intervention was reasoning about, so effectiveness is recomputed from attempts
 rather than tracked alongside them.
 
+`adherence.py` owns Plan Adherence derivation, the other half of the same
+question: `outcomes.py` asks whether an accepted recommendation helped, this
+asks whether it happened at all. It stores nothing either — an applied event
+carries its own provenance and every attempt its own timestamp — and it
+measures only events a Plan Proposal wrote, because holding the recommender to
+plans the learner authored would credit it for advice it never gave.
+
+`calibration.py` owns every correction the recommender makes to its own
+constants, and is the only consumer of `outcomes.py` and `adherence.py`:
+observed activity duration replacing a Domain Pack default, a day-capacity
+factor replacing an unexamined phase budget, and a bounded priority delta from
+measured effectiveness. Each correction is sample-gated, bounded, and reports
+the number it started from, so a surprising plan traces back to an observation
+rather than to a score. Non-adherence never reaches the effectiveness path; it
+reaches capacity, where "the day was too full" is the finding it supports.
+
 `day_plan.py` owns the Day Plan projection: study-window derivation, event
 packing, per-phase budgets, and which Schedule an event belongs to. It is pure
 and writes nothing; `plan_proposal.apply` is the only path that turns its
-output into Schedule events, and it is restricted to events.
+output into Schedule events, and it is restricted to events. A capacity factor
+may tighten a day's budget but never inflate it — a phase's `effort_minutes` is
+the Learner's own statement of intent, and measurement may show that statement
+optimistic without volunteering them for more.
 
 `prompt_budget.py` owns Prompt Context Fragment budgeting: marked-region
 extraction, CJK-aware token estimation, and allocation of one shared pool
@@ -103,6 +122,14 @@ _Avoid_: To-do list, fixed curriculum, mastery queue
 **Intervention Outcome**:
 A derived comparison between the verification status an accepted Intervention was reasoning about and the evidence recorded after its decision. An accepted Intervention with no later evidence is not-attempted, which is a statement about adherence and never about whether the recommendation was sound.
 _Avoid_: Success rate, mastery gain, intervention score
+
+**Plan Adherence**:
+A derived comparison between the events an accepted Day Plan wrote into a Schedule and the evidence recorded on that date. An event that has not yet ended is pending, not missed, and evidence matching no planned event is off-plan study rather than absence.
+_Avoid_: Completion percentage, discipline score, streak
+
+**Calibration**:
+A bounded, sample-gated correction the recommender applies to its own stated constants from what it has measured about itself. It never overrides a judgment about the Learner and never changes which Intervention an Objective receives.
+_Avoid_: Learning rate, model training, adaptive difficulty
 
 **Plan Proposal**:
 A durable candidate that preserves selected Interventions and their evidence provenance for Learner review. Acceptance records a decision; applying it to a Schedule remains a separate explicit act.

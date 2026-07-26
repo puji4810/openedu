@@ -107,6 +107,25 @@ def build_intervention_outcomes(
     about whether the recommendation would have worked.
     """
 
+    # Every Intervention against the same Objective is judged over the same
+    # scoped history, and a project accumulates many decisions about few
+    # Objectives, so the diagnosis is built once per Objective rather than once
+    # per decision.  ``attempts`` does not change within a call, which is what
+    # makes the reuse exact rather than merely cheap.
+    diagnosed: dict[str, dict[str, Any]] = {}
+
+    def dimensions_for(objective_id: str) -> dict[str, Any]:
+        if objective_id not in diagnosed:
+            scoped = [
+                attempt
+                for attempt in attempts
+                if objective_id in {str(value) for value in attempt.get("objective_ids") or []}
+            ]
+            diagnosed[objective_id] = (
+                diagnosis_builder(scoped).get("evidence_dimensions") or {}
+            )
+        return diagnosed[objective_id]
+
     outcomes: list[dict[str, Any]] = []
     for proposal in proposals:
         if proposal.get("status") != "accepted":
@@ -131,12 +150,7 @@ def build_intervention_outcomes(
             # The current status is judged over the whole history for that
             # objective, not only the evidence since: independence is a claim
             # about the capability, not about a time slice of it.
-            scoped = [
-                attempt
-                for attempt in attempts
-                if objective_id in {str(value) for value in attempt.get("objective_ids") or []}
-            ]
-            dimensions = diagnosis_builder(scoped).get("evidence_dimensions") or {}
+            dimensions = dimensions_for(objective_id)
             current = str(
                 (dimensions.get(dimension) or {}).get("verification_status") or "unobserved"
             )
