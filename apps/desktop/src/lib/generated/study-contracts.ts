@@ -54,6 +54,11 @@ export interface StudyPromptPolicy {
   project_summary_max_chars: number
   total_max_chars: number
   updates_apply: "next_session"
+  total_max_tokens?: number
+  base_reserve_tokens?: number | null
+  intent_reserve_tokens?: number | null
+  domain_reserve_tokens?: number | null
+  project_summary_reserve_tokens?: number | null
   [key: string]: unknown
 }
 
@@ -423,24 +428,82 @@ const STUDY_CONTRACT_SCHEMA = {
           "title": "Base Max Chars",
           "type": "integer"
         },
+        "base_reserve_tokens": {
+          "anyOf": [
+            {
+              "minimum": 1,
+              "type": "integer"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Base Reserve Tokens"
+        },
         "domain_max_chars": {
           "minimum": 1,
           "title": "Domain Max Chars",
           "type": "integer"
+        },
+        "domain_reserve_tokens": {
+          "anyOf": [
+            {
+              "minimum": 1,
+              "type": "integer"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Domain Reserve Tokens"
         },
         "intent_max_chars": {
           "minimum": 1,
           "title": "Intent Max Chars",
           "type": "integer"
         },
+        "intent_reserve_tokens": {
+          "anyOf": [
+            {
+              "minimum": 1,
+              "type": "integer"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Intent Reserve Tokens"
+        },
         "project_summary_max_chars": {
           "minimum": 1,
           "title": "Project Summary Max Chars",
           "type": "integer"
         },
+        "project_summary_reserve_tokens": {
+          "anyOf": [
+            {
+              "minimum": 1,
+              "type": "integer"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Project Summary Reserve Tokens"
+        },
         "total_max_chars": {
           "minimum": 1,
           "title": "Total Max Chars",
+          "type": "integer"
+        },
+        "total_max_tokens": {
+          "default": 1800,
+          "minimum": 1,
+          "title": "Total Max Tokens",
           "type": "integer"
         },
         "updates_apply": {

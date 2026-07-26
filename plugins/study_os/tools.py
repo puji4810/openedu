@@ -6,6 +6,7 @@ import json
 import os
 import re
 from collections import Counter
+from collections.abc import Mapping
 from copy import deepcopy
 from datetime import date, datetime, timedelta
 from pathlib import Path
@@ -26,10 +27,19 @@ from plugins.study_os.notes import (
     _note_subject,
     _parse_frontmatter,
     _read_text,
+    _read_text_prefix,
     _safe_relative_path,
     _strip_wikilink,
     _write_text,
     parse_note,
+)
+from plugins.study_os.prompt_budget import (
+    allocate,
+    estimate_tokens,
+    extract_prompt_fragment,
+    resolve_reserves,
+    truncate_to_chars,
+    truncate_to_tokens,
 )
 from plugins.study_os.reviews import (
     StudyReviewReadModel,
@@ -169,6 +179,68 @@ def _read_project_manifest(vault: Path, project_id: Any = None) -> dict[str, Any
     if not isinstance(validated, dict):
         raise ValueError("Project validator returned invalid data")
     return validated
+
+
+def _prompt_policy(project: Mapping[str, Any]) -> dict[str, Any]:
+    """Resolve a project's prompt policy against the defaults.
+
+    Single resolver for both sides of the prompt budget. The write path
+    (``update_prompt_summary``) and the read path (``prompt_context.load``) used
+    to merge and index the policy independently, which is how one field grew two
+    contradictory meanings; they now share this one entry point.
+    """
+
+    policy = project.get("prompt_policy")
+    return {**DEFAULT_PROMPT_POLICY, **(policy if isinstance(policy, Mapping) else {})}
+
+
+def _prompt_budget(policy: Mapping[str, Any]) -> tuple[int, int]:
+    """Resolve the shared prompt pool as ``(tokens, characters)``.
+
+    The only place either number is interpreted. Both describe one thing: what
+    ``prompt_context.load`` may spend across *all* fragments in a single turn.
+    ``total_max_chars`` used to be read a second time, independently, as a
+    ceiling on how many characters ``update_prompt_summary`` would store in one
+    file -- one field, two denotations, two call sites free to drift. Storage no
+    longer consults the prompt budget at all; the write path uses these numbers
+    only to say, in a warning, how much of what it stored the reader can reach.
+    """
+
+    return int(policy["total_max_tokens"]), int(policy["total_max_chars"])
+
+
+def _prompt_summary_path(vault: Path, project_id: str) -> Path:
+    return _project_dir(vault, project_id) / "prompt_summary.md"
+
+
+def _summary_reach_warnings(summary: str, policy: Mapping[str, Any]) -> list[str]:
+    """Report the part of a stored summary ``prompt_context.load`` cannot reach.
+
+    Both budgets are whole-pool bounds, and sound in both directions:
+    project_summary is the lowest-priority fragment, so it can never be granted
+    more than the pool base, intent and domain draw from first. Reporting them
+    is the point. The write path used to bound storage in *characters* while the
+    reader binds primarily in *tokens*, so a 5048-character Chinese summary was
+    stored clean, reported ``ok`` with no warnings at all, and then delivered at
+    1311 characters: 74% of the user's project memory silently out of reach.
+    """
+
+    pool_tokens, total_max_chars = _prompt_budget(policy)
+    warnings: list[str] = []
+    tokens = estimate_tokens(summary)
+    if tokens > pool_tokens:
+        warnings.append(
+            f"summary is {tokens} tokens; prompt_context.load shares a {pool_tokens} "
+            "token pool (total_max_tokens) across every fragment, so its tail will "
+            "not reach the model"
+        )
+    if len(summary) > total_max_chars:
+        warnings.append(
+            f"summary is {len(summary)} characters; prompt_context.load shares a "
+            f"{total_max_chars} character ceiling (total_max_chars) across every "
+            "fragment, so its tail will not reach the model"
+        )
+    return warnings
 
 
 def _schedule_dir(vault: Path, project_id: str) -> Path:
@@ -1947,7 +2019,7 @@ def handle_study_project(args: dict[str, Any], **_kwargs) -> str:
         if action == "status":
             manifest = _read_project_manifest(vault, args.get("project_id"))
             project_id = manifest["project_id"]
-            prompt_summary = _project_dir(vault, project_id) / "prompt_summary.md"
+            prompt_summary = _prompt_summary_path(vault, project_id)
             schedules = sorted(_schedule_dir(vault, project_id).glob("*.json"))
             return _ok(
                 {
@@ -1960,14 +2032,27 @@ def handle_study_project(args: dict[str, Any], **_kwargs) -> str:
         if action == "update_prompt_summary":
             manifest = _read_project_manifest(vault, args.get("project_id"))
             summary = str(args.get("summary") or "")
-            max_chars = int(manifest.get("prompt_policy", {}).get("project_summary_max_chars", 1200))
-            warnings: list[str] = []
-            if len(summary) > max_chars:
-                summary = summary[:max_chars]
-                warnings.append(f"summary truncated to {max_chars} characters")
-            path = _project_dir(vault, manifest["project_id"]) / "prompt_summary.md"
+            # prompt_summary.md is project *memory*, not prompt text: it is
+            # stored whole and the reader budgets it per intent. Bounding
+            # storage by a prompt-policy field made lowering the injected prompt
+            # destroy stored memory (total_max_chars 6000 -> 2200 shrank a
+            # 4330-character summary to 2186 on the next write), and it still
+            # refused text the reader would have delivered, because a
+            # boundary-preferring cut can land far below its ceiling -- 3600
+            # characters stored against a 4050-character grant, with a warning
+            # that named total_max_chars when the constraint that actually cut
+            # was prompt_budget's unexposed boundary retention floor. The read
+            # path's cost is bounded where it is paid, in _read_summary_text.
+            path = _prompt_summary_path(vault, manifest["project_id"])
             _write_text(path, summary)
-            return _ok({"project_id": manifest["project_id"], "path": path.relative_to(vault).as_posix(), "char_count": len(summary)}, warnings)
+            return _ok(
+                {
+                    "project_id": manifest["project_id"],
+                    "path": path.relative_to(vault).as_posix(),
+                    "char_count": len(summary),
+                },
+                _summary_reach_warnings(summary, _prompt_policy(manifest)),
+            )
         return _err("INVALID_ACTION", f"Unsupported study_project action: {action}")
     except ValueError as exc:
         return _err("VALIDATION_FAILED", str(exc))
@@ -2100,13 +2185,87 @@ def _skill_path(skill_name: str) -> Path:
     return Path(__file__).resolve().parent / "skills" / skill_name / "SKILL.md"
 
 
-def _read_prompt_fragment(kind: str, path: Path, max_chars: int) -> tuple[dict[str, Any] | None, str | None]:
+def _prompt_fragment(kind: str, source: str, content: str) -> dict[str, Any]:
+    return {
+        "kind": kind,
+        "source": source,
+        "char_count": len(content),
+        "token_count": estimate_tokens(content),
+        "content": content,
+    }
+
+
+def _prompt_source_label(path: Path) -> str:
+    root = Path(__file__).resolve().parent
+    try:
+        return path.relative_to(root).as_posix()
+    except ValueError:
+        return path.as_posix()
+
+
+def _read_prompt_fragment(kind: str, path: Path) -> tuple[dict[str, Any] | None, list[str]]:
+    """Read one marked prompt fragment.
+
+    Returns ``(fragment, warnings)``. A missing source yields ``(None, [why])``
+    and the caller decides whether that is fatal; content size is never fatal
+    here because budgeting now happens in prompt_budget.allocate. Marker
+    warnings are returned even when the extracted region turns out to be empty,
+    because an empty region is usually *caused* by the marker mistake the
+    warning names.
+    """
+
+    label = _prompt_source_label(path)
     if not path.exists():
-        return None, f"{kind} prompt source missing: {path.relative_to(Path(__file__).resolve().parent)}"
-    content = _read_text(path)
-    if len(content) > max_chars:
-        return None, f"{kind} prompt source exceeds {max_chars} characters"
-    return {"kind": kind, "source": path.as_posix(), "char_count": len(content), "content": content}, None
+        return None, [f"{kind} prompt source missing: {label}"]
+    content, warning = extract_prompt_fragment(_read_text(path), source=label)
+    warnings = [warning] if warning else []
+    if not content:
+        warnings.append(f"{kind} prompt source has no marked content: {label}")
+    return _prompt_fragment(kind, path.as_posix(), content), warnings
+
+
+# base and intent carry the routing contract, so the degradation ladder never
+# drops them: it truncates them instead. Only a policy whose pool cannot hold
+# MIN_VIABLE_TOKENS for each of them -- i.e. cannot produce even a truncated
+# base -- is an error.
+_REQUIRED_PROMPT_KINDS = ("base", "intent")
+# Ladder step 3: a domain fragment is worthless in fragmentary form, so it is
+# dropped rather than truncated below its reserve. project_summary is not in
+# this set because step 1 truncates it to whatever is left before step 2 drops
+# it -- a clipped summary is still a usable summary.
+_ATOMIC_PROMPT_KINDS = ("domain",)
+
+
+def _read_summary_text(path: Path, pool_tokens: int) -> str:
+    """Read exactly as much of ``prompt_summary.md`` as the pool can ever fund.
+
+    Unlike every skill fragment, this file lives in the vault: the user, an
+    Obsidian sync or a bad merge can put anything in it, and the reader pays for
+    it on *every* turn. A 1.2 MB file cost 1.5 s of estimator and prefix-count
+    work per ``prompt_context.load`` -- and 10 MB cost 13 s and 70 MB of RSS --
+    to deliver the same 4050 characters.
+
+    ``estimate_tokens`` charges every four non-CJK characters one token and each
+    CJK character one, so a fragment of ``n`` tokens is at most ``4 * n``
+    characters and no grant drawn from this pool can reach past
+    ``4 * pool_tokens``. Reading four characters beyond that keeps the result
+    *identical* to reading the whole file rather than merely close to it: a text
+    this long provably estimates above the pool, so it is truncated either way,
+    and the binary search plus the boundary scan both land inside the prefix.
+    """
+
+    return _read_text_prefix(path, 4 * max(0, pool_tokens) + 4)
+
+
+def _drop_reason(kind: str, budget: int, reserve: int, unit: str) -> str:
+    """Explain which budget retired a fragment, naming the knob to widen."""
+
+    if kind in _ATOMIC_PROMPT_KINDS:
+        return (
+            f"the {budget} {unit} budget could not hold it above "
+            f"its {reserve} {unit} reserve"
+        )
+    return f"the {budget} {unit} budget was exhausted by higher-priority fragments"
 
 
 def handle_study_prompt_context(args: dict[str, Any], **_kwargs) -> str:
@@ -2116,58 +2275,165 @@ def handle_study_prompt_context(args: dict[str, Any], **_kwargs) -> str:
         if intent not in _VALID_PROMPT_INTENTS:
             return _err("INVALID_INTENT", f"Unsupported StudyOS intent: {intent}")
         project = _read_project_manifest(vault, args.get("project_id"))
-        policy = {**DEFAULT_PROMPT_POLICY, **project.get("prompt_policy", {})}
+        policy = _prompt_policy(project)
+        pool_tokens, total_max_chars = _prompt_budget(policy)
         domain_pack = str(args.get("domain_pack") or project.get("domain_pack") or "").strip()
-        fragments: list[dict[str, Any]] = []
         warnings: list[str] = []
-        for kind, path, cap in (
-            ("base", _skill_path("study-os"), int(policy["base_max_chars"])),
-            ("intent", _skill_path(_INTENT_SKILL[intent]), int(policy["intent_max_chars"])),
-        ):
-            fragment, warning = _read_prompt_fragment(kind, path, cap)
-            if warning:
-                return _err("PROMPT_CONTEXT_TOO_LARGE" if "exceeds" in warning else "PROMPT_CONTEXT_SOURCE_MISSING", warning)
-            if fragment:
-                fragments.append(fragment)
+        # Candidates are collected in degradation-ladder priority order:
+        # base > intent > domain > project_summary.
+        candidates: list[dict[str, Any]] = []
+        for kind, skill in (("base", "study-os"), ("intent", _INTENT_SKILL[intent])):
+            fragment, fragment_warnings = _read_prompt_fragment(kind, _skill_path(skill))
+            if fragment is None or not fragment["content"]:
+                # base and intent decide routing; without them there is nothing
+                # to degrade to.
+                return _err("PROMPT_CONTEXT_SOURCE_MISSING", fragment_warnings[-1])
+            warnings.extend(fragment_warnings)
+            candidates.append(fragment)
         domain_skill = domain_pack_for(domain_pack).prompt_skill
         if domain_skill:
-            fragment, warning = _read_prompt_fragment("domain", _skill_path(domain_skill), int(policy["domain_max_chars"]))
-            if warning:
-                return _err("PROMPT_CONTEXT_TOO_LARGE" if "exceeds" in warning else "PROMPT_CONTEXT_SOURCE_MISSING", warning)
-            if fragment:
-                fragments.append(fragment)
-        total_max_chars = int(policy["total_max_chars"])
-        fixed_char_count = sum(fragment["char_count"] for fragment in fragments)
-        if fixed_char_count > total_max_chars:
-            return _err("PROMPT_CONTEXT_TOO_LARGE", f"prompt context exceeds {total_max_chars} total characters")
-        summary_path = _project_dir(vault, project["project_id"]) / "prompt_summary.md"
+            fragment, fragment_warnings = _read_prompt_fragment("domain", _skill_path(domain_skill))
+            # Soft failure: a domain pack whose skill file is missing, empty, or
+            # mis-marked still routes, it just loses its domain flavour. Every
+            # reason is reported -- a silently absent domain fragment is the
+            # degradation this loader exists to make impossible.
+            if fragment is None or not fragment["content"]:
+                warnings.extend(fragment_warnings[:-1])
+                warnings.append(f"{fragment_warnings[-1]}; domain fragment skipped")
+            else:
+                warnings.extend(fragment_warnings)
+                candidates.append(fragment)
+        summary_path = _prompt_summary_path(vault, project["project_id"])
         if summary_path.exists():
-            content = _read_text(summary_path)
-            max_chars = min(
-                int(policy["project_summary_max_chars"]),
-                total_max_chars - fixed_char_count,
-            )
-            if len(content) > max_chars:
-                content = content[:max_chars]
-                warnings.append(f"project_summary truncated to {max_chars} characters")
-            fragments.append(
-                {
-                    "kind": "project_summary",
-                    "source": summary_path.relative_to(vault).as_posix(),
-                    "char_count": len(content),
-                    "content": content,
-                }
-            )
-        total = sum(fragment["char_count"] for fragment in fragments)
-        if total > total_max_chars:
-            return _err("PROMPT_CONTEXT_TOO_LARGE", f"prompt context exceeds {total_max_chars} total characters")
+            summary = _read_summary_text(summary_path, pool_tokens)
+            if summary:
+                candidates.append(
+                    _prompt_fragment(
+                        "project_summary",
+                        summary_path.relative_to(vault).as_posix(),
+                        summary,
+                    )
+                )
+        reserves = resolve_reserves(policy)
+        # Both budgets run through the same ladder. Enforcing total_max_chars
+        # greedily per fragment used to bypass the priority order entirely, so
+        # a lower-priority fragment could survive while base was cut.
+        char_reserves = {kind: int(policy[f"{kind}_max_chars"]) for kind in reserves}
+        # Cut memo shared with allocate's slack reclaim: allocate asks what a
+        # grant really costs, the staging loop then reuses the very cut it was
+        # told about, so the reclaim can never over-spend the pool.
+        token_cuts: dict[tuple[str, int], tuple[str, bool]] = {}
+        contents = {candidate["kind"]: candidate["content"] for candidate in candidates}
+
+        def _token_cut(kind: str, grant: int) -> tuple[str, bool]:
+            key = (kind, grant)
+            if key not in token_cuts:
+                token_cuts[key] = truncate_to_tokens(contents[kind], grant)
+            return token_cuts[key]
+
+        token_grants = allocate(
+            pool_tokens,
+            [
+                (candidate["kind"], candidate["token_count"], reserves[candidate["kind"]])
+                for candidate in candidates
+            ],
+            protected=_REQUIRED_PROMPT_KINDS,
+            drop_below_reserve=_ATOMIC_PROMPT_KINDS,
+            measure=lambda kind, grant: estimate_tokens(_token_cut(kind, grant)[0]),
+        )
+        staged: list[tuple[dict[str, Any], str, bool]] = []
+        for candidate in candidates:
+            kind = candidate["kind"]
+            content, token_truncated = _token_cut(kind, token_grants[kind])
+            if not content:
+                if kind in _REQUIRED_PROMPT_KINDS:
+                    return _err(
+                        "PROMPT_CONTEXT_TOO_LARGE",
+                        f"prompt budget cannot hold the {kind} fragment: "
+                        f"total_max_tokens {pool_tokens} is too small to route",
+                    )
+                warnings.append(
+                    f"{kind} fragment dropped: {_drop_reason(kind, pool_tokens, reserves[kind], 'token')}"
+                )
+                continue
+            staged.append((candidate, content, token_truncated))
+        char_cuts: dict[tuple[str, int], tuple[str, bool]] = {}
+        staged_contents = {candidate["kind"]: content for candidate, content, _t in staged}
+
+        def _char_cut(kind: str, grant: int) -> tuple[str, bool]:
+            key = (kind, grant)
+            if key not in char_cuts:
+                char_cuts[key] = truncate_to_chars(staged_contents[kind], grant)
+            return char_cuts[key]
+
+        char_grants = allocate(
+            total_max_chars,
+            [
+                (candidate["kind"], len(content), char_reserves[candidate["kind"]])
+                for candidate, content, _truncated in staged
+            ],
+            protected=_REQUIRED_PROMPT_KINDS,
+            drop_below_reserve=_ATOMIC_PROMPT_KINDS,
+            measure=lambda kind, grant: len(_char_cut(kind, grant)[0]),
+        )
+        fragments: list[dict[str, Any]] = []
+        used_chars = 0
+        for candidate, content, token_truncated in staged:
+            kind = candidate["kind"]
+            content, char_truncated = _char_cut(kind, char_grants[kind])
+            if not content:
+                if kind in _REQUIRED_PROMPT_KINDS:
+                    return _err(
+                        "PROMPT_CONTEXT_TOO_LARGE",
+                        f"prompt budget cannot hold the {kind} fragment: "
+                        f"total_max_chars {total_max_chars} is too small to route",
+                    )
+                warnings.append(
+                    f"{kind} fragment dropped: "
+                    f"{_drop_reason(kind, total_max_chars, char_reserves[kind], 'character')}"
+                )
+                continue
+            if token_truncated:
+                warnings.append(
+                    f"{kind} fragment truncated to {estimate_tokens(content)} tokens "
+                    f"(allocated {token_grants[kind]} of a {pool_tokens} token pool)"
+                )
+            if char_truncated:
+                warnings.append(
+                    f"{kind} fragment truncated to {len(content)} characters "
+                    f"(allocated {char_grants[kind]} of a {total_max_chars} character ceiling)"
+                )
+            used_chars += len(content)
+            fragments.append(_prompt_fragment(kind, candidate["source"], content))
+        delivered = {fragment["kind"] for fragment in fragments}
         return _ok(
             {
                 "intent": intent,
                 "project_id": project["project_id"],
                 "domain_pack": domain_pack,
                 "fragments": fragments,
-                "total_char_count": total,
+                "total_char_count": used_chars,
+                "total_token_count": sum(fragment["token_count"] for fragment in fragments),
+                "budget": {
+                    "pool_tokens": pool_tokens,
+                    "total_max_chars": total_max_chars,
+                    "reserve_tokens": reserves,
+                    # Grants for dropped kinds are reported as 0 so the budget
+                    # block always describes what was actually delivered. A
+                    # grant is the bound a fragment was cut against, not a
+                    # disbursement: because allocate hands the slack of one cut
+                    # down the ladder, two grants can cover the same tokens and
+                    # their sum can exceed pool_tokens. total_token_count is the
+                    # number bounded by the pool.
+                    "granted_tokens": {
+                        kind: (grant if kind in delivered else 0)
+                        for kind, grant in token_grants.items()
+                    },
+                    "granted_chars": {
+                        kind: (char_grants.get(kind, 0) if kind in delivered else 0)
+                        for kind in token_grants
+                    },
+                },
             },
             warnings,
         )
@@ -2503,7 +2769,13 @@ STUDY_PROJECT_SCHEMA = {
             },
             "vault_path": _VAULT_PROP,
             "action": {"type": "string", "enum": ["init", "select", "status", "update_prompt_summary"]},
-            "summary": {"type": "string", "description": "Prompt summary markdown for update_prompt_summary."},
+            "summary": {
+                "type": "string",
+                "description": (
+                    "Prompt summary markdown for update_prompt_summary. Stored up to the "
+                    "project's total_max_chars; prompt_context.load budgets it further per intent."
+                ),
+            },
         },
         "required": ["action"],
     },
@@ -2591,7 +2863,7 @@ STUDY_SCHEDULE_SCHEMA = {
 }
 
 STUDY_PROMPT_CONTEXT_SCHEMA = {
-    "description": "Return capped StudyOS prompt fragments for one project intent without mutating prompts.",
+    "description": "Return budgeted StudyOS prompt fragments for one project intent without mutating prompts.",
     "parameters": {
         "type": "object",
         "properties": {

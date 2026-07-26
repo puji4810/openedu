@@ -45,6 +45,20 @@ def _read_text(path: Path) -> str:
     return path.read_text(encoding="utf-8", errors="replace")
 
 
+def _read_text_prefix(path: Path, limit: int) -> str:
+    """Read at most ``limit`` characters, for files a caller can bound up front.
+
+    A vault file is user-editable and arbitrarily large; a caller that can prove
+    it will never look past a given character reads that far and no further,
+    instead of paying for the whole file on every call.
+    """
+
+    if limit <= 0:
+        return ""
+    with path.open("r", encoding="utf-8", errors="replace") as handle:
+        return handle.read(limit)
+
+
 def _write_text(path: Path, content: str) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(content, encoding="utf-8")

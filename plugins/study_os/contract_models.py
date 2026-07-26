@@ -140,12 +140,22 @@ class StudyObjective(_ContractModel):
 
 
 class StudyPromptPolicy(_ContractModel):
+    # The five *_max_chars fields stay required and unrenamed: on-disk
+    # manifests and the generated TypeScript contract carry them. Their
+    # meaning moved -- the per-kind values are token reserves (floors) rather
+    # than hard caps -- but their shape did not. New fields are optional with
+    # defaults so legacy manifests keep validating.
     base_max_chars: PositiveInt
     intent_max_chars: PositiveInt
     domain_max_chars: PositiveInt
     project_summary_max_chars: PositiveInt
     total_max_chars: PositiveInt
     updates_apply: Literal["next_session"]
+    total_max_tokens: PositiveInt = 1800
+    base_reserve_tokens: PositiveInt | None = None
+    intent_reserve_tokens: PositiveInt | None = None
+    domain_reserve_tokens: PositiveInt | None = None
+    project_summary_reserve_tokens: PositiveInt | None = None
 
 
 class StudyProjectV1(_ContractModel):

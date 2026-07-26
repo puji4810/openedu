@@ -57,12 +57,21 @@ VERIFICATION_STATUSES = {"unobserved", "developing", "supported", "independent"}
 EVIDENCE_AGE_BANDS = {"unobserved", "fresh", "aging", "stale"}
 DEADLINE_BANDS = {"none", "distant", "approaching", "near", "critical", "overdue"}
 
+# The per-kind ``*_max_chars`` values are no longer hard caps that reject an
+# oversized fragment: prompt_budget.resolve_reserves reinterprets them as
+# priority-ordered token reserves (a guaranteed floor) drawn from the
+# ``total_max_tokens`` pool. ``total_max_chars`` survives as a secondary hard
+# ceiling on the summed fragment characters. Every field here describes one
+# thing -- what prompt_context.load may spend in a turn. None of them bounds
+# storage: handle_study_project's update_prompt_summary action stores the
+# summary whole and reports what the reader can reach.
 DEFAULT_PROMPT_POLICY: dict[str, Any] = {
     "base_max_chars": 2000,
     "intent_max_chars": 2500,
     "domain_max_chars": 2000,
     "project_summary_max_chars": 1200,
     "total_max_chars": 6000,
+    "total_max_tokens": 1800,
     "updates_apply": "next_session",
 }
 

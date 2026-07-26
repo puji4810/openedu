@@ -5,6 +5,8 @@ from pathlib import Path
 
 import pytest
 
+from plugins.study_os.prompt_budget import FRAGMENT_BEGIN_MARKER, FRAGMENT_END_MARKER
+
 
 @pytest.fixture
 def vault(tmp_path: Path) -> Path:
@@ -832,8 +834,10 @@ def test_study_project_engineering_prompt_context(vault: Path):
     assert init["data"]["project"]["workspace_type"] == "hybrid"
     assert context["ok"] is True
     fragments = {fragment["kind"]: fragment["content"] for fragment in context["data"]["fragments"]}
-    assert "engineering and skill learning" in fragments["domain"]
+    # Marked fragments carry body text only, never the YAML frontmatter.
+    assert "engineering-repo" in fragments["domain"]
     assert "hybrid" in fragments["domain"]
+    assert "description:" not in fragments["domain"]
     assert template["ok"] is True
     assert template["data"]["schedule"]["events"][0]["subject_id"] == "ai-infra"
     assert "Scout one concept" in template["data"]["schedule"]["events"][0]["title"]
@@ -1075,7 +1079,7 @@ def test_study_project_and_prompt_context_reject_invalid_inputs(vault: Path):
     assert not (vault.parent / "escape").exists()
 
 
-def test_study_prompt_context_truncates_project_summary(vault: Path):
+def test_study_prompt_context_reserves_do_not_cap_project_summary(vault: Path):
     from plugins.study_os.tools import handle_study_project, handle_study_prompt_context
 
     init = _loads(
@@ -1111,21 +1115,176 @@ def test_study_prompt_context_truncates_project_summary(vault: Path):
 
     assert init["ok"] is True
     assert summary["ok"] is True
-    assert summary["warnings"] == ["summary truncated to 1200 characters"]
-    (vault / ".StudyOS" / "projects" / "general-2027" / "prompt_summary.md").write_text("y" * 2000, encoding="utf-8")
-    context = _loads(
-        handle_study_prompt_context(
+    # project_summary_max_chars is a reserve on both paths now: 2000 chars is
+    # well past the 1200-char reserve, so the write path stores it untouched and
+    # prompt_context.load delivers it whole while the pool has room for it.
+    assert summary["warnings"] == []
+    assert summary["data"]["char_count"] == 2000
+    assert (
+        vault / ".StudyOS" / "projects" / "general-2027" / "prompt_summary.md"
+    ).read_text(encoding="utf-8") == "x" * 2000
+    assert context["ok"] is True
+    fragments = {fragment["kind"]: fragment for fragment in context["data"]["fragments"]}
+    assert not [warning for warning in context["warnings"] if "project_summary" in warning]
+    assert 0 < fragments["project_summary"]["char_count"] <= 2000
+    budget = context["data"]["budget"]
+    assert fragments["project_summary"]["token_count"] <= budget["granted_tokens"]["project_summary"]
+    assert context["data"]["total_token_count"] <= budget["pool_tokens"]
+
+
+def _tighten_prompt_policy(vault: Path, project_id: str, **overrides) -> None:
+    manifest_path = vault / ".StudyOS" / "projects" / project_id / "manifest.json"
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    manifest["prompt_policy"] = {**manifest["prompt_policy"], **overrides}
+    manifest_path.write_text(json.dumps(manifest, ensure_ascii=False), encoding="utf-8")
+
+
+def _update_prompt_summary(vault: Path, project_id: str, summary: str) -> dict:
+    from plugins.study_os.tools import handle_study_project
+
+    return _loads(
+        handle_study_project(
             {
                 "vault_path": str(vault),
-                "intent": "reviewing",
-                "project_id": "general-2027",
+                "action": "update_prompt_summary",
+                "project_id": project_id,
+                "summary": summary,
             }
         )
     )
+
+
+def test_study_project_stores_summaries_larger_than_the_project_summary_reserve(vault: Path):
+    """The sanctioned writer must reach the headroom the reader will deliver.
+
+    project_summary_max_chars (1200) is a floor for prompt_context.load, not a
+    ceiling; enforcing it here made ~3000 characters of reachable budget
+    unwritable through the only tool that exists for the job.
+    """
+
+    assert _init_project(vault, "general-2027", "general.v1")["ok"] is True
+
+    written = _update_prompt_summary(vault, "general-2027", "x" * 3000)
+    context = _load_prompt_context(vault, "general-2027")
+
+    assert written["ok"] is True
+    assert written["warnings"] == []
+    assert written["data"]["char_count"] == 3000
+    summary_path = vault / ".StudyOS" / "projects" / "general-2027" / "prompt_summary.md"
+    assert len(summary_path.read_text(encoding="utf-8")) == 3000
     assert context["ok"] is True
-    assert context["warnings"] == ["project_summary truncated to 1200 characters"]
     fragments = {fragment["kind"]: fragment for fragment in context["data"]["fragments"]}
-    assert fragments["project_summary"]["char_count"] == 1200
+    assert fragments["project_summary"]["char_count"] > 1200
+
+
+def test_study_project_stores_an_oversized_summary_whole_and_says_what_is_reachable(
+    vault: Path,
+):
+    """Storage is project memory; the prompt budget describes it, never cuts it.
+
+    A boundary-preferring cut at a storage ceiling refused text the reader would
+    have delivered -- this summary's only section break below 6000 characters
+    sits at 3600, so 449 characters of reachable budget were unwritable -- and
+    the warning blamed total_max_chars when the constraint that actually cut was
+    prompt_budget's unexposed boundary retention floor.
+    """
+
+    assert _init_project(vault, "general-2027", "general.v1")["ok"] is True
+    oversized = "x" * 3600 + "\n## Later section" + "y" * 20000
+
+    written = _update_prompt_summary(vault, "general-2027", oversized)
+    context = _load_prompt_context(vault, "general-2027")
+
+    assert written["ok"] is True
+    assert written["data"]["char_count"] == len(oversized)
+    stored = (vault / ".StudyOS" / "projects" / "general-2027" / "prompt_summary.md").read_text(
+        encoding="utf-8"
+    )
+    assert stored == oversized
+    assert [warning.split(";")[0] for warning in written["warnings"]] == [
+        "summary is 5905 tokens",
+        "summary is 23617 characters",
+    ]
+    for warning in written["warnings"]:
+        assert "will not reach the model" in warning
+    assert "total_max_tokens" in written["warnings"][0]
+    assert "total_max_chars" in written["warnings"][1]
+    fragments = {fragment["kind"]: fragment for fragment in context["data"]["fragments"]}
+    assert fragments["project_summary"]["char_count"] > 3600
+
+
+def test_study_project_storage_does_not_shrink_when_the_prompt_budget_does(vault: Path):
+    """Lowering the injected prompt must not destroy stored project memory."""
+
+    assert _init_project(vault, "general-2027", "general.v1")["ok"] is True
+    _tighten_prompt_policy(vault, "general-2027", total_max_chars=1500)
+
+    written = _update_prompt_summary(vault, "general-2027", "x" * 3000)
+
+    assert written["ok"] is True
+    assert written["data"]["char_count"] == 3000
+    assert (
+        vault / ".StudyOS" / "projects" / "general-2027" / "prompt_summary.md"
+    ).read_text(encoding="utf-8") == "x" * 3000
+    assert written["warnings"] == [
+        "summary is 3000 characters; prompt_context.load shares a 1500 character "
+        "ceiling (total_max_chars) across every fragment, so its tail will not "
+        "reach the model"
+    ]
+
+
+def test_study_project_warns_when_a_cjk_summary_outruns_the_token_pool(vault: Path):
+    """The reader binds in tokens, so a character-only ceiling saw nothing wrong.
+
+    StudyOS is 考研-facing: 5056 Chinese characters fit any character ceiling in
+    the policy and still cost ~4x their length in tokens, so this write reported
+    ok with no warnings at all while three quarters of it was unreachable.
+    """
+
+    assert _init_project(vault, "general-2027", "general.v1")["ok"] is True
+    cjk = "复习进度记录，重点在数学和英语。" * 316
+
+    written = _update_prompt_summary(vault, "general-2027", cjk)
+    context = _load_prompt_context(vault, "general-2027")
+
+    assert written["data"]["char_count"] == len(cjk) == 5056
+    assert len(written["warnings"]) == 1
+    assert written["warnings"][0].startswith("summary is 5056 tokens")
+    assert "1800 token pool (total_max_tokens)" in written["warnings"][0]
+    fragments = {fragment["kind"]: fragment for fragment in context["data"]["fragments"]}
+    assert fragments["project_summary"]["char_count"] < len(cjk)
+
+
+def test_study_prompt_context_bounds_the_work_a_huge_summary_can_cost(vault: Path):
+    """prompt_summary.md is user-editable and the reader pays for it every turn.
+
+    Obsidian sync, a script or a bad merge can put anything in this file. A
+    1.2 MB one cost 1.5 s of estimator and prefix-count work per load (10 MB:
+    13 s and +70 MB RSS) to deliver the same 4050 characters. No grant drawn
+    from an n-token pool can reach past 4n characters, so the reader stops
+    there -- and what it delivers is *identical* to reading the whole file.
+    """
+
+    from plugins.study_os.prompt_budget import truncate_to_chars, truncate_to_tokens
+    from plugins.study_os.tools import _read_summary_text
+
+    assert _init_project(vault, "general-2027", "general.v1")["ok"] is True
+    body = "# Summary\n\n" + "progress note here. " * 61440
+    assert len(body) > 1_200_000
+    path = vault / ".StudyOS" / "projects" / "general-2027" / "prompt_summary.md"
+    path.write_text(body, encoding="utf-8")
+
+    context = _load_prompt_context(vault, "general-2027")
+
+    assert len(_read_summary_text(path, 1800)) == 4 * 1800 + 4
+    budget = context["data"]["budget"]
+    fragments = {fragment["kind"]: fragment for fragment in context["data"]["fragments"]}
+    delivered = fragments["project_summary"]["content"]
+    whole_file, _truncated = truncate_to_tokens(body, budget["granted_tokens"]["project_summary"])
+    assert delivered == truncate_to_chars(
+        whole_file, budget["granted_chars"]["project_summary"]
+    )[0]
+    assert 0 < len(delivered) <= budget["total_max_chars"]
 
 
 def test_study_prompt_context_truncates_project_summary_to_total_budget(vault: Path):
@@ -1144,29 +1303,412 @@ def test_study_prompt_context_truncates_project_summary_to_total_budget(vault: P
     summary_path = vault / ".StudyOS" / "projects" / "kaoyan-2027" / "prompt_summary.md"
     summary_path.write_text("z" * 1200, encoding="utf-8")
 
-    context = _loads(
-        handle_study_prompt_context(
+    def _load() -> dict:
+        return _loads(
+            handle_study_prompt_context(
+                {
+                    "vault_path": str(vault),
+                    "intent": "reviewing",
+                    "project_id": "kaoyan-2027",
+                }
+            )
+        )
+
+    generous = _load()
+    fixed_chars = sum(
+        fragment["char_count"]
+        for fragment in generous["data"]["fragments"]
+        if fragment["kind"] != "project_summary"
+    )
+    fixed_tokens = sum(
+        fragment["token_count"]
+        for fragment in generous["data"]["fragments"]
+        if fragment["kind"] != "project_summary"
+    )
+
+    # Step 1 of the degradation ladder: the token pool binds first.
+    _tighten_prompt_policy(vault, "kaoyan-2027", total_max_tokens=fixed_tokens + 40)
+    token_bound = _load()
+    # Step 1 again, this time via the secondary character ceiling.
+    _tighten_prompt_policy(
+        vault,
+        "kaoyan-2027",
+        total_max_tokens=1800,
+        total_max_chars=fixed_chars + 200,
+    )
+    char_bound = _load()
+
+    assert initialized["ok"] is True
+    for context in (generous, token_bound, char_bound):
+        assert context["ok"] is True
+        fragments = {fragment["kind"]: fragment for fragment in context["data"]["fragments"]}
+        assert set(fragments) == {"base", "intent", "domain", "project_summary"}
+        assert 0 < fragments["project_summary"]["char_count"] <= 1200
+        budget = context["data"]["budget"]
+        assert context["data"]["total_token_count"] <= budget["pool_tokens"]
+        assert context["data"]["total_char_count"] <= budget["total_max_chars"]
+    assert generous["warnings"] == []
+    for context in (token_bound, char_bound):
+        assert any(
+            "project_summary" in warning and "truncat" in warning
+            for warning in context["warnings"]
+        ), context["warnings"]
+        assert not [
+            warning
+            for warning in context["warnings"]
+            if warning.startswith(("base ", "intent ", "domain "))
+        ]
+    assert token_bound["data"]["fragments"][-1]["token_count"] <= 40
+    assert char_bound["data"]["fragments"][-1]["char_count"] <= 200
+
+
+@pytest.fixture
+def skills_root(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
+    """Redirect prompt fragment lookups at a writable copy of the real skills.
+
+    Tests may overwrite or delete a ``SKILL.md`` under the returned root to
+    exercise marker parsing and the fail-soft ladder without editing the
+    shipped documents.
+    """
+
+    from plugins.study_os import tools as study_tools
+
+    root = tmp_path / "skills"
+    # Anchored at the repo, not the cwd: a cwd-relative glob matches nothing
+    # from a foreign working directory and the fixture would then silently
+    # publish an empty skills tree.
+    real_root = Path(__file__).resolve().parents[2] / "plugins" / "study_os" / "skills"
+    assert real_root.is_dir(), real_root
+    for source in sorted(real_root.glob("*/SKILL.md")):
+        target = root / source.parent.name / "SKILL.md"
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_text(source.read_text(encoding="utf-8"), encoding="utf-8")
+    monkeypatch.setattr(study_tools, "_skill_path", lambda name: root / name / "SKILL.md")
+    return root
+
+
+def _init_project(vault: Path, project_id: str, domain_pack: str) -> dict:
+    from plugins.study_os.tools import handle_study_project
+
+    return _loads(
+        handle_study_project(
             {
                 "vault_path": str(vault),
-                "intent": "reviewing",
-                "project_id": "kaoyan-2027",
+                "action": "init",
+                "project_id": project_id,
+                "domain_pack": domain_pack,
             }
         )
     )
 
+
+def _load_prompt_context(vault: Path, project_id: str, intent: str = "reviewing") -> dict:
+    from plugins.study_os.tools import handle_study_prompt_context
+
+    return _loads(
+        handle_study_prompt_context(
+            {"vault_path": str(vault), "intent": intent, "project_id": project_id}
+        )
+    )
+
+
+def test_study_prompt_context_uses_only_the_marked_region(vault: Path, skills_root: Path):
+    (skills_root / "study-os" / "SKILL.md").write_text(
+        "---\n"
+        "name: study-os\n"
+        "description: Route StudyOS learning workflows.\n"
+        "---\n\n"
+        "PREAMBLE_OUTSIDE_MARKERS\n\n"
+        "<!-- prompt-context:begin -->\n"
+        "FIRST_MARKED_REGION\n"
+        "<!-- prompt-context:end -->\n\n"
+        "REFERENCE_OUTSIDE_MARKERS\n\n"
+        "<!-- prompt-context:begin -->\n"
+        "SECOND_MARKED_REGION\n"
+        "<!-- prompt-context:end -->\n\n"
+        "TRAILER_OUTSIDE_MARKERS\n",
+        encoding="utf-8",
+    )
+
+    initialized = _init_project(vault, "general-2027", "general.v1")
+    context = _load_prompt_context(vault, "general-2027")
+
     assert initialized["ok"] is True
     assert context["ok"] is True
     fragments = {fragment["kind"]: fragment for fragment in context["data"]["fragments"]}
-    fixed_char_count = sum(
-        fragment["char_count"]
-        for kind, fragment in fragments.items()
-        if kind != "project_summary"
+    # Every marked region, in document order, joined by a blank line; nothing
+    # outside the markers (frontmatter included) reaches the prompt.
+    assert fragments["base"]["content"] == "FIRST_MARKED_REGION\n\nSECOND_MARKED_REGION"
+    for excluded in (
+        "PREAMBLE_OUTSIDE_MARKERS",
+        "REFERENCE_OUTSIDE_MARKERS",
+        "TRAILER_OUTSIDE_MARKERS",
+        "description:",
+    ):
+        assert excluded not in fragments["base"]["content"]
+    assert context["warnings"] == []
+
+
+def test_study_prompt_context_falls_back_to_whole_unmarked_skill(vault: Path, skills_root: Path):
+    body = (
+        "---\n"
+        "name: study-review\n"
+        "description: Run flexible StudyOS spaced-repetition reviews.\n"
+        "---\n\n"
+        "# Legacy Unmarked Skill\n\n"
+        "This document carries no prompt-context markers at all.\n"
     )
-    remaining = 6000 - fixed_char_count
-    assert 0 < remaining < 1200
-    assert context["data"]["total_char_count"] == 6000
-    assert fragments["project_summary"]["char_count"] == remaining
-    assert context["warnings"] == [f"project_summary truncated to {remaining} characters"]
+    (skills_root / "study-review" / "SKILL.md").write_text(body, encoding="utf-8")
+
+    initialized = _init_project(vault, "general-2027", "general.v1")
+    context = _load_prompt_context(vault, "general-2027")
+
+    assert initialized["ok"] is True
+    assert context["ok"] is True
+    fragments = {fragment["kind"]: fragment for fragment in context["data"]["fragments"]}
+    assert fragments["intent"]["content"] == body
+    assert context["warnings"] == []
+
+
+def test_study_prompt_context_warns_once_on_unterminated_marker(vault: Path, skills_root: Path):
+    (skills_root / "study-review" / "SKILL.md").write_text(
+        "---\nname: study-review\ndescription: Run reviews.\n---\n\n"
+        "DROPPED_PREAMBLE\n\n"
+        "<!-- prompt-context:begin -->\n"
+        "TAIL_OF_DOCUMENT\n",
+        encoding="utf-8",
+    )
+
+    initialized = _init_project(vault, "general-2027", "general.v1")
+    context = _load_prompt_context(vault, "general-2027")
+
+    assert initialized["ok"] is True
+    assert context["ok"] is True
+    fragments = {fragment["kind"]: fragment for fragment in context["data"]["fragments"]}
+    assert fragments["intent"]["content"] == "TAIL_OF_DOCUMENT"
+    assert "DROPPED_PREAMBLE" not in fragments["intent"]["content"]
+    assert [warning for warning in context["warnings"] if "unterminated" in warning]
+
+
+def test_study_prompt_context_skips_missing_domain_skill_with_warning(vault: Path, skills_root: Path):
+    (skills_root / "study-kaoyan" / "SKILL.md").unlink()
+
+    initialized = _init_project(vault, "kaoyan-2027", "kaoyan.v1")
+    context = _load_prompt_context(vault, "kaoyan-2027")
+
+    assert initialized["ok"] is True
+    # A domain pack whose skill file is gone degrades to base + intent routing
+    # instead of failing closed the way the old fixed-cap loader did.
+    assert context["ok"] is True
+    assert {fragment["kind"] for fragment in context["data"]["fragments"]} == {"base", "intent"}
+    assert [
+        warning
+        for warning in context["warnings"]
+        if "domain" in warning and "skipped" in warning
+    ], context["warnings"]
+
+
+@pytest.mark.parametrize("kind, skill", [("base", "study-os"), ("intent", "study-review")])
+def test_study_prompt_context_still_fails_closed_without_base_or_intent(
+    vault: Path, skills_root: Path, kind: str, skill: str
+):
+    (skills_root / skill / "SKILL.md").unlink()
+
+    initialized = _init_project(vault, "kaoyan-2027", "kaoyan.v1")
+    context = _load_prompt_context(vault, "kaoyan-2027")
+
+    assert initialized["ok"] is True
+    assert context["ok"] is False
+    assert context["error"]["code"] == "PROMPT_CONTEXT_SOURCE_MISSING"
+    assert kind in context["error"]["message"]
+
+
+def test_study_prompt_context_degrades_oversized_project_summary(vault: Path):
+    initialized = _init_project(vault, "kaoyan-2027", "kaoyan.v1")
+    summary_path = vault / ".StudyOS" / "projects" / "kaoyan-2027" / "prompt_summary.md"
+    summary_path.write_text("q" * 200_000, encoding="utf-8")
+
+    context = _load_prompt_context(vault, "kaoyan-2027")
+
+    assert initialized["ok"] is True
+    # A summary far larger than the whole pool degrades; it never produces
+    # PROMPT_CONTEXT_TOO_LARGE and never suppresses the routing fragments.
+    assert context["ok"] is True
+    fragments = {fragment["kind"]: fragment for fragment in context["data"]["fragments"]}
+    assert set(fragments) == {"base", "intent", "domain", "project_summary"}
+    # Ladder step 1 (truncate) fires before step 2 (drop), so the summary is
+    # still delivered, just clipped and flagged.
+    assert [
+        warning
+        for warning in context["warnings"]
+        if warning.startswith("project_summary fragment truncated")
+    ], context["warnings"]
+    assert fragments["project_summary"]["content"].endswith("…")
+    assert fragments["project_summary"]["char_count"] < 200_000
+    budget = context["data"]["budget"]
+    assert context["data"]["total_token_count"] <= budget["pool_tokens"]
+    assert context["data"]["total_char_count"] <= budget["total_max_chars"]
+
+
+def test_study_prompt_context_never_drops_base_or_intent(vault: Path):
+    initialized = _init_project(vault, "kaoyan-2027", "kaoyan.v1")
+    summary_path = vault / ".StudyOS" / "projects" / "kaoyan-2027" / "prompt_summary.md"
+    summary_path.write_text("w" * 4000, encoding="utf-8")
+
+    generous = _load_prompt_context(vault, "kaoyan-2027")
+    routing_tokens = sum(
+        fragment["token_count"]
+        for fragment in generous["data"]["fragments"]
+        if fragment["kind"] in ("base", "intent")
+    )
+    # Squeeze the pool down to less than base + intent alone need: the ladder
+    # must drop the optional fragments and truncate the routing ones instead of
+    # returning nothing.
+    _tighten_prompt_policy(vault, "kaoyan-2027", total_max_tokens=routing_tokens - 20)
+    squeezed = _load_prompt_context(vault, "kaoyan-2027")
+
+    assert initialized["ok"] is True
+    assert squeezed["ok"] is True
+    fragments = {fragment["kind"]: fragment for fragment in squeezed["data"]["fragments"]}
+    assert set(fragments) == {"base", "intent"}
+    assert fragments["base"]["content"]
+    assert fragments["intent"]["content"]
+    for dropped in ("domain", "project_summary"):
+        assert [
+            warning
+            for warning in squeezed["warnings"]
+            if warning.startswith(f"{dropped} fragment dropped")
+        ], squeezed["warnings"]
+    assert squeezed["data"]["total_token_count"] <= routing_tokens - 20
+
+
+@pytest.mark.parametrize("pool", [4, 20, 100, 232, 233, 400, 546, 547, 800])
+def test_study_prompt_context_returns_routing_fragments_at_any_usable_pool(
+    vault: Path, pool: int
+):
+    _init_project(vault, "kaoyan-2027", "kaoyan.v1")
+    _tighten_prompt_policy(vault, "kaoyan-2027", total_max_tokens=pool)
+
+    context = _load_prompt_context(vault, "kaoyan-2027")
+
+    # base used to be funded to its full want before intent got anything, so
+    # every pool under ~234 produced PROMPT_CONTEXT_TOO_LARGE and ZERO
+    # fragments -- "generic Hermes with no StudyOS rules" by another door.
+    assert context["ok"] is True, context
+    fragments = {fragment["kind"]: fragment for fragment in context["data"]["fragments"]}
+    assert {"base", "intent"} <= set(fragments), (pool, fragments)
+    for kind in ("base", "intent"):
+        assert fragments[kind]["content"], (pool, kind)
+    assert context["data"]["total_token_count"] <= pool
+
+
+def test_study_prompt_context_sacrifices_the_summary_before_the_routing_pair(
+    vault: Path, skills_root: Path
+):
+    def _inflate(name: str, size: int) -> None:
+        path = skills_root / name / "SKILL.md"
+        text = path.read_text(encoding="utf-8")
+        begin = text.index(FRAGMENT_BEGIN_MARKER) + len(FRAGMENT_BEGIN_MARKER)
+        end = text.index(FRAGMENT_END_MARKER)
+        filler = "\n- an extra operating rule that grows the marked region.\n" * 200
+        path.write_text(text[:begin] + (text[begin:end] + filler)[:size] + text[end:], "utf-8")
+
+    _inflate("study-os", 4000)
+    _inflate("study-review", 3000)
+    _init_project(vault, "kaoyan-2027", "kaoyan.v1")
+    summary_path = vault / ".StudyOS" / "projects" / "kaoyan-2027" / "prompt_summary.md"
+    summary_path.write_text("s" * 1200, encoding="utf-8")
+    _tighten_prompt_policy(vault, "kaoyan-2027", total_max_chars=100_000)
+
+    context = _load_prompt_context(vault, "kaoyan-2027")
+
+    assert context["ok"] is True
+    fragments = {fragment["kind"]: fragment for fragment in context["data"]["fragments"]}
+    # The ladder retires project_summary and domain; it never clips the routing
+    # contract to make room for a project summary.
+    assert set(fragments) == {"base", "intent"}
+    for kind in ("base", "intent"):
+        assert not fragments[kind]["content"].endswith("…"), kind
+    for dropped in ("domain", "project_summary"):
+        assert [
+            warning
+            for warning in context["warnings"]
+            if warning.startswith(f"{dropped} fragment dropped")
+        ], context["warnings"]
+
+
+def test_study_prompt_context_drops_domain_rather_than_stubbing_it(vault: Path):
+    _init_project(vault, "kaoyan-2027", "kaoyan.v1")
+    generous = _load_prompt_context(vault, "kaoyan-2027")
+    routing_tokens = sum(
+        fragment["token_count"]
+        for fragment in generous["data"]["fragments"]
+        if fragment["kind"] in ("base", "intent")
+    )
+
+    contexts = {}
+    for spare in (200, 100, 13):
+        _tighten_prompt_policy(vault, "kaoyan-2027", total_max_tokens=routing_tokens + spare)
+        contexts[spare] = _load_prompt_context(vault, "kaoyan-2027")
+
+    for spare, context in contexts.items():
+        kinds = {fragment["kind"] for fragment in context["data"]["fragments"]}
+        # A domain fragment below its reserve is a truncated heading and half a
+        # sentence presented as the domain's operating rules; drop it instead.
+        assert kinds == {"base", "intent"}, (spare, kinds)
+        assert [
+            warning
+            for warning in context["warnings"]
+            if warning.startswith("domain fragment dropped") and "reserve" in warning
+        ], (spare, context["warnings"])
+
+
+def test_study_prompt_context_char_ceiling_follows_the_same_ladder(vault: Path):
+    _init_project(vault, "kaoyan-2027", "kaoyan.v1")
+    generous = _load_prompt_context(vault, "kaoyan-2027")
+    sizes = {fragment["kind"]: fragment["char_count"] for fragment in generous["data"]["fragments"]}
+    _tighten_prompt_policy(
+        vault, "kaoyan-2027", total_max_chars=sizes["base"] + sizes["intent"] + 100
+    )
+
+    context = _load_prompt_context(vault, "kaoyan-2027")
+
+    assert context["ok"] is True
+    fragments = {fragment["kind"]: fragment for fragment in context["data"]["fragments"]}
+    # total_max_chars used to be spent greedily per fragment, which let the
+    # lowest-priority fragment survive on characters base had left unused.
+    assert set(fragments) == {"base", "intent"}
+    assert fragments["base"]["char_count"] == sizes["base"]
+    assert fragments["intent"]["char_count"] == sizes["intent"]
+    assert context["data"]["total_char_count"] <= sizes["base"] + sizes["intent"] + 100
+
+
+@pytest.mark.parametrize(
+    "body",
+    [
+        f"---\nname: study-kaoyan\ndescription: Guide.\n---\n\n"
+        f"prose\n\n{FRAGMENT_BEGIN_MARKER}\n{FRAGMENT_END_MARKER}\n",
+        f"---\nname: study-kaoyan\ndescription: Guide.\n---\n\nprose\n\n{FRAGMENT_BEGIN_MARKER}\n",
+        f"---\nname: study-kaoyan\ndescription: Guide.\n---\n\n"
+        f"{FRAGMENT_END_MARKER}\nprose\n{FRAGMENT_BEGIN_MARKER}\n",
+    ],
+    ids=["empty-region", "unterminated-at-eof", "reversed-markers"],
+)
+def test_study_prompt_context_warns_when_a_domain_region_is_empty(
+    vault: Path, skills_root: Path, body: str
+):
+    (skills_root / "study-kaoyan" / "SKILL.md").write_text(body, encoding="utf-8")
+
+    _init_project(vault, "kaoyan-2027", "kaoyan.v1")
+    context = _load_prompt_context(vault, "kaoyan-2027")
+
+    assert context["ok"] is True
+    assert {fragment["kind"] for fragment in context["data"]["fragments"]} == {"base", "intent"}
+    # A marker mistake must never lose the 考研 rules silently: the skip is
+    # reported, and so is the marker warning that explains it.
+    assert [
+        warning for warning in context["warnings"] if "domain" in warning and "skipped" in warning
+    ], context["warnings"]
 
 
 def test_study_activity_loads_all_workflow_contexts_within_budget(vault: Path):
@@ -1282,7 +1824,7 @@ def test_study_os_skill_descriptions_and_budgets(monkeypatch):
             "study-os": ("Route StudyOS learning workflows.", 6000),
             "study-plan": ("Create, revise, and persist StudyOS learning schedules.", 9000),
             "study-organize": ("Organize problems into StudyOS notes.", 9000),
-            "study-review": ("Run StudyOS spaced repetition reviews.", 9000),
+            "study-review": ("Run flexible StudyOS spaced-repetition reviews.", 9000),
             "study-teach": ("Teach through StudyOS learning records.", 9000),
             "study-lesson": ("Create visual StudyOS lesson artifacts.", 9000),
             "study-assessment": ("Analyze StudyOS exams and mistakes.", 9000),
@@ -1317,6 +1859,139 @@ def test_study_os_skill_descriptions_and_budgets(monkeypatch):
             registry.deregister(name)
 
 
+def _register_study_os_against(skills_root: Path, monkeypatch):
+    """Run ``study_os.register`` against a writable copy of the shipped skills."""
+
+    from hermes_cli import plugins as plugins_mod
+    from hermes_cli.plugins import PluginContext, PluginManager, PluginManifest
+    from plugins import study_os
+    from tools.registry import registry
+
+    real_root = Path(__file__).resolve().parents[2] / "plugins" / "study_os" / "skills"
+    for source in sorted(real_root.glob("*/SKILL.md")):
+        target = skills_root / source.parent.name / "SKILL.md"
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_text(source.read_text(encoding="utf-8"), encoding="utf-8")
+
+    manager = PluginManager()
+    monkeypatch.setattr(plugins_mod, "_plugin_manager", manager)
+    monkeypatch.setattr(study_os, "_SKILLS_ROOT", skills_root)
+    manifest = PluginManifest(name="study_os", version="0.1.0", description="study", source="bundled")
+
+    def _run():
+        try:
+            study_os.register(PluginContext(manifest, manager))
+        finally:
+            for name in ("study_activity", "study_coach"):
+                registry.deregister(name)
+
+    return manager, _run
+
+
+def _rewrite_frontmatter(path: Path, **fields: str) -> None:
+    lines = path.read_text(encoding="utf-8").splitlines(keepends=True)
+    for index, line in enumerate(lines):
+        key = line.split(":", 1)[0]
+        if key in fields:
+            lines[index] = f"{key}: {fields[key]}\n"
+    path.write_text("".join(lines), encoding="utf-8")
+
+
+def test_study_os_registration_is_all_or_nothing(tmp_path: Path, monkeypatch):
+    """Half-registered is the worst state: live tools and hooks, dead routing.
+
+    study-review is the fourth of eleven registrations, so validating inside the
+    registration loop left three skills routable, both pre_llm_call hooks
+    appended and study_activity/study_coach in the global registry -- while the
+    plugin manager caught the exception and recorded study_os as failed with no
+    tools at all.
+    """
+
+    from tools.registry import registry
+
+    skills_root = tmp_path / "skills"
+    manager, run = _register_study_os_against(skills_root, monkeypatch)
+    _rewrite_frontmatter(skills_root / "study-review" / "SKILL.md", name="study-reviews")
+
+    with pytest.raises(ValueError) as excinfo:
+        run()
+
+    assert "'study-review'" in str(excinfo.value)
+    assert manager._plugin_skills == {}
+    assert manager._hooks.get("pre_llm_call", []) == []
+    assert registry.get_entry("study_activity") is None
+    assert registry.get_entry("study_coach") is None
+
+
+def test_study_os_registers_a_description_longer_than_the_routing_index_clips(
+    tmp_path: Path, monkeypatch
+):
+    """The 60-character clip belongs to a code path plugin skills never take.
+
+    ``agent.skill_utils.extract_skill_description`` clips at 60, but its only
+    caller indexes the flat skills tree plus the configured external dirs, and
+    plugin skills enter neither. Rejecting a long description here traded a
+    truncation that cannot happen for a plugin that refuses to load.
+    """
+
+    skills_root = tmp_path / "skills"
+    manager, run = _register_study_os_against(skills_root, monkeypatch)
+    long_description = "Guide 考研 learning with StudyOS across every 科目 and every stage."
+    assert len(long_description) > 60
+    _rewrite_frontmatter(skills_root / "study-kaoyan" / "SKILL.md", description=long_description)
+
+    run()
+
+    assert len(manager._plugin_skills) == 11
+    assert manager._plugin_skills["study_os:study-kaoyan"]["description"] == long_description
+
+
+def test_study_os_registration_rejects_a_frontmatter_name_that_disagrees(
+    tmp_path: Path, monkeypatch
+):
+    skills_root = tmp_path / "skills"
+    _manager, run = _register_study_os_against(skills_root, monkeypatch)
+    _rewrite_frontmatter(skills_root / "study-teach" / "SKILL.md", name="study-teaching")
+
+    with pytest.raises(ValueError) as excinfo:
+        run()
+
+    assert "'study-teach'" in str(excinfo.value)
+
+
+def test_study_os_registration_still_rejects_a_bad_domain_pack_skill(
+    tmp_path: Path, monkeypatch
+):
+    skills_root = tmp_path / "skills"
+    _manager, run = _register_study_os_against(skills_root, monkeypatch)
+    _rewrite_frontmatter(skills_root / "study-kaoyan" / "SKILL.md", description="")
+
+    with pytest.raises(ValueError) as excinfo:
+        run()
+
+    assert "DomainPack kaoyan.v1 prompt skill" in str(excinfo.value)
+
+
+def test_study_os_routing_descriptions_come_from_the_skill_frontmatter(
+    tmp_path: Path, monkeypatch
+):
+    """No second copy of the description: editing the file moves the routing."""
+
+    skills_root = tmp_path / "skills"
+    manager, run = _register_study_os_against(skills_root, monkeypatch)
+    _rewrite_frontmatter(
+        skills_root / "study-organize" / "SKILL.md",
+        description="Sort StudyOS problems into notes.",
+    )
+
+    run()
+
+    assert (
+        manager._plugin_skills["study_os:study-organize"]["description"]
+        == "Sort StudyOS problems into notes."
+    )
+
+
 def test_study_os_skills_document_the_model_lifecycle_contract():
     from plugins.study_os.learning import STUDY_COACH_SCHEMA
 
@@ -1341,7 +2016,10 @@ def test_study_review_skill_documents_bounded_yaml_tag_selection():
     for term in ("YAML tag", "limit", "exclude_paths", "available_count"):
         assert term in review
     assert "never broaden" in review.casefold()
-    assert len(review) <= 2500
+    # No whole-file size guard here on purpose: prose below the end marker never
+    # reaches the model, so bounding the document would recreate the very cliff
+    # the marked-region loader removed. The shared 9000-char guard in
+    # test_study_os_skill_descriptions_and_budgets still covers this file.
 
 
 def test_study_review_skill_documents_automatic_review_levels():

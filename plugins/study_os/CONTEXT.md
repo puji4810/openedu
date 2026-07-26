@@ -21,6 +21,25 @@ concept projections. HTTP, overview, and model-tool adapters reuse this module
 instead of rebuilding selection rules. `StudyNoteCatalog` owns safe Vault note
 discovery and parsing underneath it; neither module expands the model schema.
 
+`prompt_budget.py` owns Prompt Context Fragment budgeting: marked-region
+extraction, CJK-aware token estimation, and allocation of one shared pool
+across the `base`, `intent`, `domain`, and `project_summary` fragments in that
+priority order. Fragments degrade rather than fail — an over-budget request
+retires whole fragments from the bottom up with a warning each, and `base` and
+`intent` are only ever truncated, never dropped, because those two carry the
+routing contract. A missing `base` or `intent` source is an error; a pool too
+small to give each of them a body plus an ellipsis is the one remaining
+`PROMPT_CONTEXT_TOO_LARGE`.
+
+The `project_summary` fragment is the exception to "a region of a Skill
+document": it is `prompt_summary.md`, written by the learner through
+`study_project(action="update_prompt_summary")`. It is project *memory*, so the
+write path stores it whole and only warns how much of it the reader can reach;
+no prompt-policy number is a storage ceiling. The read path bounds its own cost
+instead, scanning at most four characters per pool token — the most any grant
+can reach — because that file is editable outside StudyOS and is read on every
+turn.
+
 ## Language
 
 **Learner**:
@@ -93,3 +112,7 @@ editing the shared runtime or model-tool schemas.
 **Activity Adapter**:
 A Domain Pack implementation that proposes Activities and validates domain-specific Evidence Events at the StudyOS seam.
 _Avoid_: Tool wrapper, domain database
+
+**Prompt Context Fragment**:
+A delimited region of a Skill document injected as bounded routing instruction for one turn, charged against a shared token budget by priority. Prose outside the markers stays in the document as reference and never reaches the model.
+_Avoid_: Whole skill file, system prompt edit, capped prompt template
