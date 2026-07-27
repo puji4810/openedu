@@ -1042,6 +1042,10 @@ _CATEGORY_MERGE: Dict[str, str] = {
     "prompt_caching": "agent",
     "goals": "agent",
     "updates": "general",
+    # `study_os.vault_path` is the only schema-surfaced StudyOS setting; the
+    # dedicated StudyOS UI owns its setup flow, so keep the generic settings
+    # page from creating a one-field plugin category for it.
+    "study_os": "general",
     # `onboarding.profile_build` is the only schema-surfaced onboarding field
     # (`onboarding.seen` is an internal latch dict, not a user setting), so fold
     # it into the agent tab rather than spawning a one-field orphan category.

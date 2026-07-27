@@ -2038,6 +2038,20 @@ def init_agent(
             2000,
         ),
     )
+    # Remote compaction over OpenAI's POST /responses/compact. Only attempted
+    # on first-party api.openai.com and ChatGPT Codex OAuth Responses
+    # surfaces; every other provider ignores this knob. See
+    # agent/openai_remote_compaction.py.
+    openai_remote_compaction = str(
+        _compression_cfg.get("openai_remote", "auto") or "auto"
+    ).lower()
+    if openai_remote_compaction not in {"auto", "off"}:
+        _ra().logger.warning(
+            "Invalid compression.openai_remote=%r; using 'auto'. "
+            "Valid values are: auto, off.",
+            openai_remote_compaction,
+        )
+        openai_remote_compaction = "auto"
     codex_app_server_auto_compaction = str(
         _compression_cfg.get("codex_app_server_auto", "native") or "native"
     ).lower()
@@ -2504,6 +2518,7 @@ def init_agent(
             compression_micro_compact_defrag_tokens
         )
     agent.codex_app_server_auto_compaction = codex_app_server_auto_compaction
+    agent.openai_remote_compaction = openai_remote_compaction
     agent.max_compression_attempts = compression_max_attempts
     agent.compression_idle_compact_after_seconds = (
         compression_idle_compact_after_seconds

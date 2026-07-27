@@ -2125,6 +2125,73 @@ def finalize_context_engine_compression_notification(
     return bool(pending())
 
 
+def _try_remote_compaction(
+    agent: Any,
+    messages: list,
+    *,
+    system_message: Optional[str],
+    approx_tokens: Optional[int],
+    focus_topic: Optional[str] = None,
+    memory_context: str = "",
+) -> Optional[list]:
+    """Compact via OpenAI's ``/v1/responses/compact`` when the runtime allows.
+
+    Returns the compacted message list, or ``None`` when remote compaction is
+    ineligible or failed — the caller then falls back to the local summarising
+    compressor.  On success the compressor's per-call result fields are set to
+    the same values a local compression would have left behind, because
+    :func:`compress_context` reads them immediately afterwards to decide
+    whether to warn, rotate the session, and arm the effectiveness verdict.
+
+    A user-supplied ``focus_topic`` (``/compress <focus>``) always routes to
+    the local compressor: the endpoint has no focus dial, and honouring an
+    explicit user instruction matters more than the token win.
+    """
+    if focus_topic:
+        logger.debug("remote compaction skipped: /compress focus topic requested")
+        return None
+
+    try:
+        from agent.openai_remote_compaction import compact_messages_via_openai
+
+        compressed = compact_messages_via_openai(
+            agent,
+            messages,
+            system_message=system_message,
+            approx_tokens=approx_tokens,
+            memory_context=memory_context,
+        )
+    except Exception:
+        logger.warning("remote compaction raised; using local compression", exc_info=True)
+        return None
+
+    if not compressed:
+        return None
+
+    compressor = agent.context_compressor
+    try:
+        from agent.model_metadata import estimate_messages_tokens_rough
+
+        before = estimate_messages_tokens_rough(messages)
+        after = estimate_messages_tokens_rough(compressed)
+        compressor._last_compression_savings_pct = (
+            (before - after) / before * 100 if before > 0 else 0.0
+        )
+    except Exception:
+        compressor._last_compression_savings_pct = 0.0
+
+    # No auxiliary summariser ran, so none of its failure state applies.
+    compressor._last_summary_dropped_count = 0
+    compressor._last_summary_fallback_used = False
+    compressor._last_summary_error = None
+    compressor._last_aux_model_failure_error = None
+    compressor._last_aux_model_failure_model = None
+    compressor._last_compress_aborted = False
+    compressor._last_compression_made_progress = True
+    compressor.compression_count = getattr(compressor, "compression_count", 0) + 1
+    return compressed
+
+
 def compress_context(
     agent: Any,
     messages: list,
@@ -2840,7 +2907,20 @@ def compress_context(
                 with aux_progress_hook(_progress_hook), aux_interrupt_protection(
                     cancel_event=_hard_cancel_event
                 ):
-                    compressed = compress_fn(messages, **compress_kwargs)
+                    # Prefer first-party OpenAI Responses compaction, but keep
+                    # it inside the same fenced/cancellable transaction as the
+                    # local summarizer. Any ineligible or failed remote call
+                    # falls back without changing the commit lifecycle.
+                    compressed = _try_remote_compaction(
+                        agent,
+                        messages,
+                        system_message=system_message,
+                        approx_tokens=approx_tokens,
+                        focus_topic=focus_topic,
+                        memory_context=memory_context,
+                    )
+                    if compressed is None:
+                        compressed = compress_fn(messages, **compress_kwargs)
                     # Freeze a hard stop that arrived after the final provider
                     # attempt unwound but before this transaction can rotate
                     # session state.

@@ -705,6 +705,11 @@ DEFAULT_CONFIG = {
                                       # autoraise banner. Set False to keep the
                                       # 85% threshold autoraise but suppress the
                                       # user-facing notice in CLI/gateway output.
+        "openai_remote": "auto",      # Remote compaction on first-party OpenAI
+                                      # Responses endpoints. auto uses
+                                      # POST /v1/responses/compact and falls back
+                                      # to the local summarizer on any failure;
+                                      # off always uses the local summarizer.
         "codex_app_server_auto": "native",  # Codex app-server (codex CLI runtime) thread
                                       # compaction mode. The codex agent owns the real
                                       # thread context, so Hermes' summarizer cannot

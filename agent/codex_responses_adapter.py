@@ -496,6 +496,19 @@ def _chat_messages_to_responses_input(
                 if isinstance(codex_reasoning, list):
                     for ri in codex_reasoning:
                         if isinstance(ri, dict) and ri.get("encrypted_content"):
+                            # ``codex_reasoning_items`` is the carrier for every
+                            # opaque, issuer-sealed Responses replay item — that
+                            # includes compaction items minted by
+                            # /v1/responses/compact (see
+                            # agent/openai_remote_compaction.py). Compaction items
+                            # replay through the same guards below, but unlike a
+                            # reasoning item they do NOT require a following item,
+                            # so they must not force the empty-assistant filler.
+                            _is_compaction_item = ri.get("type") in {
+                                "compaction",
+                                "compaction_summary",
+                                "context_compaction",
+                            }
                             item_id = ri.get("id")
                             if item_id and item_id in seen_item_ids:
                                 continue
@@ -536,7 +549,8 @@ def _chat_messages_to_responses_input(
                             items.append(replay_item)
                             if item_id:
                                 seen_item_ids.add(item_id)
-                            has_codex_reasoning = True
+                            if not _is_compaction_item:
+                                has_codex_reasoning = True
 
                 # Replay exact assistant message items (with id/phase) from
                 # previous turns so the API can maintain prefix-cache hits.
@@ -792,6 +806,33 @@ def _preflight_codex_input_items(
                     "output": sanitize_text(output),
                 }
             )
+            continue
+
+        if item_type in {
+            "compaction",
+            "compaction_summary",
+            "context_compaction",
+        }:
+            # Opaque state minted by POST /v1/responses/compact. Replayed as
+            # an input item on the next request; ``id`` is dropped for the
+            # same reason reasoning ids are (store=False cannot resolve it
+            # server-side). See agent/openai_remote_compaction.py.
+            encrypted = item.get("encrypted_content")
+            if isinstance(encrypted, str) and encrypted:
+                item_id = item.get("id")
+                if isinstance(item_id, str) and item_id:
+                    if item_id in seen_ids:
+                        continue
+                    seen_ids.add(item_id)
+                normalized_type = (
+                    "compaction"
+                    if item_type == "compaction_summary"
+                    else item_type
+                )
+                normalized.append({
+                    "type": normalized_type,
+                    "encrypted_content": encrypted,
+                })
             continue
 
         if item_type == "reasoning":

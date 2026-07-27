@@ -1738,6 +1738,11 @@ class TestBuildSchemaFromConfig:
 
 
 
+    def test_study_os_setting_does_not_create_an_orphan_category(self):
+        """StudyOS's lone setting should live with the general settings."""
+        from hermes_cli.web_server import CONFIG_SCHEMA
+        assert CONFIG_SCHEMA["study_os.vault_path"]["category"] == "general"
+
     def test_no_single_field_categories(self):
         """After merging, no category should have just 1 field."""
         from hermes_cli.web_server import CONFIG_SCHEMA
