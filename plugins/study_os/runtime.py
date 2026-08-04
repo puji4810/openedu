@@ -164,7 +164,8 @@ class LearningRuntime:
         if conversation_id:
             session["conversation_session_id"] = conversation_id
         snapshot = self._competency_snapshot(session)
-        session["current_activity"] = self._next_activity(session, snapshot, [])
+        continuation = self._continuation_state(session)
+        session["current_activity"] = self._next_activity(session, continuation)
         self._save_session(session)
         if conversation_id:
             self._bind_conversation(conversation_id, resolved_session_id)
@@ -172,6 +173,7 @@ class LearningRuntime:
             "session": session,
             "next_activity": session["current_activity"],
             "competency_snapshot": snapshot,
+            "continuation": continuation,
         }
 
     def advance(self, *, session_id: Any, observation: Any) -> dict[str, Any]:
@@ -226,7 +228,8 @@ class LearningRuntime:
         session["evidence_ids"] = list(dict.fromkeys([*session.get("evidence_ids", []), evidence_id]))
         snapshot = self._competency_snapshot(session)
         recommendations = self.recommendation_builder(self._diagnosis_for(session))
-        session["current_activity"] = self._next_activity(session, snapshot, recommendations)
+        continuation = self._continuation_state(session)
+        session["current_activity"] = self._next_activity(session, continuation)
         session["updated_at"] = self._now()
         self._save_session(session)
         return {
@@ -235,6 +238,7 @@ class LearningRuntime:
             "next_activity": session["current_activity"],
             "competency_snapshot": snapshot,
             "recommendations": recommendations,
+            "continuation": continuation,
         }
 
     def snapshot(self, *, session_id: Any) -> dict[str, Any]:
@@ -360,6 +364,67 @@ class LearningRuntime:
         learning_session_id = str(session["session_id"])
         return [attempt for attempt in attempts if attempt.get("session_id") == learning_session_id]
 
+    def _session_attempts(self, session: dict[str, Any]) -> list[dict[str, Any]]:
+        """Return evidence produced by this Session, excluding historical evidence.
+
+        Competency snapshots intentionally include earlier attempts for referenced
+        Objectives. Pacing cannot use that projection: a fresh Session still owes
+        the learner the Activity they just asked to perform, while completion must
+        depend only on work performed inside this Session.
+        """
+
+        learning_session_id = str(session["session_id"])
+        return [
+            attempt
+            for attempt in self.attempt_reader(str(self.project["project_id"]))
+            if attempt.get("session_id") == learning_session_id
+        ]
+
+    def _continuation_state(self, session: dict[str, Any]) -> dict[str, Any]:
+        """Derive whether the learner has another contracted Activity to perform.
+
+        Evidence targets are obligations to *observe*, not a mandate to keep
+        probing until every dimension becomes independently verified. Follow-up
+        recommendations remain available to the caller, but starting another
+        probe is a learner-controlled decision for a later Session.
+        """
+
+        attempts = self._session_attempts(session)
+        observed = {
+            str(attempt.get("transfer_level"))
+            for attempt in attempts
+            if str(attempt.get("transfer_level") or "") in EVIDENCE_DIMENSIONS
+        }
+        required = list(session["contract"]["evidence_targets"])
+        pending = [dimension for dimension in required if dimension not in observed]
+        elapsed_seconds = sum(
+            int(duration)
+            for attempt in attempts
+            for duration in [attempt.get("duration_seconds")]
+            if isinstance(duration, int) and not isinstance(duration, bool) and duration >= 0
+        )
+        budget_seconds = int(session["contract"]["time_budget_minutes"]) * 60
+        if elapsed_seconds >= budget_seconds:
+            state = "ready_to_finish"
+            reason = "time_budget_reached"
+        elif not pending:
+            state = "ready_to_finish"
+            reason = "contract_evidence_observed"
+        else:
+            state = "continue"
+            reason = "contract_evidence_pending"
+        return {
+            "state": state,
+            "reason": reason,
+            "observed_evidence_targets": [
+                dimension for dimension in required if dimension in observed
+            ],
+            "pending_evidence_targets": pending,
+            "elapsed_activity_seconds": elapsed_seconds,
+            "time_budget_seconds": budget_seconds,
+            "learner_controls_follow_up": True,
+        }
+
     def _sync_evidence_ids(self, session: dict[str, Any]) -> None:
         recorded = [
             str(attempt.get("attempt_id"))
@@ -420,38 +485,16 @@ class LearningRuntime:
     def _next_activity(
         self,
         session: dict[str, Any],
-        snapshot: dict[str, Any],
-        recommendations: list[dict[str, Any]],
-    ) -> dict[str, Any]:
+        continuation: dict[str, Any],
+    ) -> dict[str, Any] | None:
         contract = session["contract"]
-        dimensions = snapshot.get("dimensions", {})
-        pending_targets = [
-            target
-            for target in contract["evidence_targets"]
-            if dimensions.get(target, {}).get("status") != "observed"
-        ]
-        selected_recommendation = recommendations[0] if recommendations else None
-        if pending_targets:
-            target = pending_targets[0]
-            reason = f"The learning contract still needs {target} evidence."
-            activity_recommendation = None
-            assistance_level = contract["assistance_level"]
-        elif selected_recommendation:
-            intervention = str(selected_recommendation.get("intervention") or "retention_probe")
-            if intervention == "near_transfer_probe":
-                target = "near_transfer"
-            elif intervention == "independence_probe":
-                target = str(selected_recommendation.get("evidence_dimension") or contract["evidence_targets"][-1])
-            else:
-                target = contract["evidence_targets"][-1]
-            reason = str(selected_recommendation.get("reason") or "Verify the current competency estimate.")
-            activity_recommendation = selected_recommendation
-            assistance_level = "independent" if intervention == "independence_probe" else contract["assistance_level"]
-        else:
-            target = contract["evidence_targets"][-1]
-            reason = "Verify the current competency estimate with a fresh, independently evaluated response."
-            activity_recommendation = None
-            assistance_level = "independent"
+        pending_targets = list(continuation["pending_evidence_targets"])
+        if continuation["state"] == "ready_to_finish" or not pending_targets:
+            return None
+        target = pending_targets[0]
+        reason = f"The learning contract still needs {target} evidence."
+        activity_recommendation = None
+        assistance_level = contract["assistance_level"]
         criteria, anchors = self._objective_details(contract)
         sequence = len(session.get("activity_history", [])) + 1
         activity = {

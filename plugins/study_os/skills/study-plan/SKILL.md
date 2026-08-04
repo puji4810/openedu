@@ -31,8 +31,8 @@ platforms: [linux, macos, windows]
 ## Proposals
 
 `plan_proposal.ensure_today` derives and persists the day's plan once; call it
-at the first StudyOS interaction of a day rather than building one by hand, and
-do not create a second plan when it returns `created: false`.
+for a daily plan or briefing rather than building one by hand, and do not
+create a second plan when it returns `created: false`.
 
 List pending proposals before saving one. Only an explicit learner decision
 permits accept/reject. Apply an accepted proposal with `plan_proposal.apply`,
@@ -42,10 +42,8 @@ is still `schedule.validate` then `schedule.save`.
 
 ## Reference
 
-Everything below is background for a human or for `skill_view`. It is not
-injected into the prompt, because the `study_activity` and `study_coach` tool
-schema descriptions already state these rules to the model whenever the
-`study` toolset is enabled.
+Everything below is background for a human or for `skill_view`. The loaded
+operation guide carries call shapes; backend validation owns their invariants.
 
 ### Entry sequence
 

@@ -9,7 +9,7 @@ from __future__ import annotations
 
 import re
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import date, datetime
 from pathlib import Path
 from typing import Any, Iterable
 
@@ -175,6 +175,21 @@ def _layer_from(path: Path, vault: Path, frontmatter: dict[str, Any]) -> str:
     return "note"
 
 
+def _json_safe_frontmatter(value: Any) -> Any:
+    """Normalize YAML-native dates before note metadata crosses the JSON boundary."""
+
+    if isinstance(value, (date, datetime)):
+        return value.isoformat()
+    if isinstance(value, dict):
+        return {
+            str(_json_safe_frontmatter(key)): _json_safe_frontmatter(item)
+            for key, item in value.items()
+        }
+    if isinstance(value, (list, tuple)):
+        return [_json_safe_frontmatter(item) for item in value]
+    return value
+
+
 def parse_note(
     path: Path,
     vault: Path,
@@ -195,7 +210,7 @@ def parse_note(
         "basename": path.name,
         "title": title,
         "layer": _layer_from(path, vault, frontmatter),
-        "frontmatter": frontmatter,
+        "frontmatter": _json_safe_frontmatter(frontmatter),
         "tags": _as_list(frontmatter.get("tags")),
         "concepts": [
             _strip_wikilink(value)

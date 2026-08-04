@@ -16,18 +16,18 @@ recall to `study-review`, teaching to `study-teach`, and diagnosis to
 
 ## Flow
 
-1. At the first StudyOS exchange of a day, call
-   `plan_proposal.ensure_today`. It derives and persists the day's plan once
-   and returns the existing one afterwards, so `created: false` means report
-   the plan already there — never build a second one by hand. Present it and
-   let the learner accept or reject; `plan_proposal.apply` then puts an
-   accepted plan on the calendar.
-2. Read relevant records before changes; persist only completed outcomes:
-   LearningRecord for demonstrated progress, LearningDecisionRecord for
+1. Enter the workflow the learner asked for. Call `plan_proposal.ensure_today`
+   only for daily planning; never interrupt review or teaching with it.
+2. The learner controls scope, pace, and stopping. Treat interaction completion
+   and evidence verification separately; never continue solely to strengthen a
+   verification label. Stopping closes future work without erasing supported
+   observations already produced.
+3. Read relevant records before changes; persist only completed outcomes:
+   LearningRecord for demonstrated progress, LearningDecisionRecord for an
    accepted strategy.
-3. Start one focused Session, follow its ActivitySpec, and meet
-   `evidence_requirements`.
-4. Never infer mastery from chat, counts, or plans.
+4. Use one evidence owner. Atomic workflows complete themselves; otherwise
+   follow one focused Session's ActivitySpec.
+5. Never infer mastery from chat, counts, or plans.
    Never mutate system prompts; active Session state is turn-local context.
 <!-- prompt-context:end -->
 

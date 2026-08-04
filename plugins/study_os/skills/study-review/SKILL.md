@@ -1,7 +1,6 @@
 ---
 name: study-review
 description: Run flexible StudyOS spaced-repetition reviews.
-platforms: [linux, macos, windows]
 ---
 
 # StudyOS Review
@@ -12,53 +11,56 @@ Use for 复习 and 艾宾浩斯 review. Load context with `study_activity`
 <!-- prompt-context:begin -->
 ## Queue
 
-Call `study_activity(resource="review", action="due", data=...)`; default data
-is `{"review_state":"due","sort":"priority","limit":10}`. For “YAML tag X, N
-questions”, add `tags:["X"]`. On shortfall report `count` and
-`available_count`; never broaden selectors to fill `limit`. If ambiguous, ask
-one scope question. If empty, report the filters and offer one relaxation;
-never switch to all.
+Call `review.due`; default due/priority/10. Respect selectors and `limit`. On
+shortfall report counts; if empty offer one relaxation, never broaden silently.
 
 ## Loop
 
-1. Read one note via `note.read` with `include_body:true`. Ask the question;
-   hide the solution; give and count hints only on request.
-2. Grade `correct`, `partial`, or `incorrect`; missing a required condition is
-   not fully correct. Explain the gap and give a concise correction.
-   Do not ask for confidence or a review level — the backend assigns it.
-3. Record exactly once, and never also call `attempt.record`:
-
-   `study_activity(resource="review", action="submit", project_id="...",
-   data={"note":"...","response":"...","result":"correct|partial|incorrect",
-   "duration_seconds":0,"hints_used":0,"diagnoses":[]})`
-
-4. Continue only after success. On failure, say it was not recorded and retry;
-   do not move on or invent a count.
-5. End with result counts, weak concepts, and one next action. Call
-   `memory.sync` when available.
+1. Hide the solution and present one coherent retrieval task at a time.
+2. Let the learner determine when their response is complete. Completion,
+   correctness, and verification strength are independent judgments.
+3. Stopping closes future work, not prior evidence. Evaluate the accumulated
+   response against the learning objective, not the percentage of requested
+   steps completed.
+4. When the response supports a result, call `review.submit` once. Leave it
+   unrecorded only when no evaluable response exists or the learner explicitly
+   discards it. Offer the next item as an option, not an obligation.
 <!-- prompt-context:end -->
 
 ## Queue selectors
 
 `review.due` selectors combine with AND:
 
-- Scope: `notes`, `subjects`, YAML `tags`, `concepts`
+- Scope: `notes`, `subjects`, YAML tags, `concepts`
 - Exclusion: `exclude_paths:[".opencode","archive"]`
 - Level: `difficulties`, `review_levels`, `min|max_review_level`
 - State: `review_state` due/new/reviewed/all; `match` any/all
 - Order: `sort` priority, oldest, newest, difficulty_asc/desc, title
 
 Hidden directories are excluded by default. `limit` caps the queue; it is
-never a target to fill.
+never a target to fill. On shortfall report `count` and `available_count`.
 
 ## Review levels
 
-The backend assigns the level, so never ask for a confidence rating:
+Do not ask for confidence or a review level; the backend assigns it:
 incorrect → Lv.1, partial → Lv.2, correct → at least Lv.3, then Lv.4/Lv.5
 after repeated correct reviews.
 
 ## Recording
 
 `review.submit` saves evidence and spacing atomically, so one call finishes a
-graded review. Never also call `attempt.record` or `review.record`. Diagnoses
-are objects, never strings; use `[]` when the response supports none.
+graded review. It is a completion action, never a checkpoint action. Never
+also call `attempt.record` or `review.record`, start or advance a Learning
+Session, or pass its returned `attempt_id` to `study_coach.advance`. Diagnoses
+are objects, never strings; use `[]` when the response supports none. Ending
+before every requested step is complete does not discard accumulated evidence.
+Preserve spacing only when no evaluable response exists or the learner
+explicitly asks not to record it.
+
+## Interaction contract
+
+Keep one response in progress until the learner treats it as complete.
+`partial` describes quality, not interaction state. Do not grade before
+completion or demand another confirmation afterwards. Judge the completed
+response against the learning objective: stopping may still support a correct,
+partial, or incorrect result. Closing future steps never erases prior evidence.

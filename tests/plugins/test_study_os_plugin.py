@@ -265,6 +265,89 @@ def test_review_submit_records_one_atomic_attempt_and_spacing_update(vault: Path
     assert list((vault / ".StudyOS" / "projects" / "general-learning" / "activity").glob("attempts-*.jsonl"))
 
 
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("path", "OS/examples/OS-0043.md"),
+        ("item_id", "OS/examples/OS-0043.md"),
+        ("notes", ["OS/examples/OS-0043.md"]),
+    ],
+)
+def test_review_submit_accepts_one_unambiguous_note_alias(
+    vault: Path,
+    field: str,
+    value: str | list[str],
+):
+    from plugins.study_os.learning import handle_study_activity
+    from plugins.study_os.tools import handle_study_project
+
+    init = _loads(handle_study_project({"vault_path": str(vault), "action": "init"}))
+    submitted = _loads(
+        handle_study_activity(
+            {
+                "resource": "review",
+                "action": "submit",
+                "vault_path": str(vault),
+                "project_id": init["data"]["project"]["project_id"],
+                "data": {
+                    field: value,
+                    "response": "插入和删除的操作位置限制不同。",
+                    "result": "correct",
+                    "duration_seconds": 1,
+                },
+            }
+        )
+    )
+
+    assert submitted["ok"] is True
+    assert submitted["data"]["attempt"]["item_id"] == "OS/examples/OS-0043.md"
+
+
+def test_note_list_and_read_serialize_yaml_dates_as_iso_strings(vault: Path):
+    from plugins.study_os.learning import handle_study_activity
+
+    dated = vault / "OS" / "examples" / "dated.md"
+    dated.write_text(
+        "---\n"
+        "type: example\n"
+        "last_reviewed_at: 2026-07-28\n"
+        "nested:\n"
+        "  due: 2026-07-29\n"
+        "---\n"
+        "# Dated review\n",
+        encoding="utf-8",
+    )
+    common = {
+        "resource": "note",
+        "vault_path": str(vault),
+    }
+
+    listed = _loads(
+        handle_study_activity(
+            {
+                **common,
+                "action": "list",
+                "data": {"folder": "OS/examples", "file_glob": "dated.md"},
+            }
+        )
+    )
+    read = _loads(
+        handle_study_activity(
+            {
+                **common,
+                "action": "read",
+                "data": {"note": "OS/examples/dated.md"},
+            }
+        )
+    )
+
+    assert listed["ok"] is True
+    assert read["ok"] is True
+    for note in (listed["data"]["notes"][0], read["data"]["note"]):
+        assert note["frontmatter"]["last_reviewed_at"] == "2026-07-28"
+        assert note["frontmatter"]["nested"]["due"] == "2026-07-29"
+
+
 def _valid_study_project() -> dict:
     return {
         "schema_version": "study_project.v1",
@@ -1992,20 +2075,27 @@ def test_study_os_routing_descriptions_come_from_the_skill_frontmatter(
     )
 
 
-def test_study_os_skills_document_the_model_lifecycle_contract():
-    from plugins.study_os.learning import STUDY_COACH_SCHEMA
-
+def test_study_os_teaching_guide_discloses_the_model_lifecycle_contract(vault: Path):
     skills_root = Path("plugins/study_os/skills")
-    router = (skills_root / "study-os" / "SKILL.md").read_text(encoding="utf-8")
     teaching = (skills_root / "study-teach" / "SKILL.md").read_text(encoding="utf-8")
-    required_contract_fields = STUDY_COACH_SCHEMA["parameters"]["properties"]["data"]["properties"][
-        "contract"
-    ]["required"]
+    assert _init_project(vault, "general-2027", "general.v1")["ok"] is True
+    context = _load_prompt_context(vault, "general-2027", intent="teaching")
+    guide = json.dumps(context["data"]["operation_guide"], ensure_ascii=False)
 
-    assert "study_coach(action=\"start\"" in router
-    assert "study_coach(action=\"advance\"" in router
-    for field in required_contract_fields:
-        assert field in router
+    for field in (
+        "session_id",
+        "mode",
+        "objective",
+        "time_budget_minutes",
+        "assistance_level",
+        "evidence_targets",
+        "response",
+        "result",
+        "evaluator",
+    ):
+        assert field in guide
+    for action in ("start", "advance", "snapshot|finish"):
+        assert action in guide
     assert "study_coach.advance" in teaching
     assert "active Session" in teaching
 
@@ -2023,17 +2113,122 @@ def test_study_review_skill_documents_bounded_yaml_tag_selection():
 
 
 def test_study_review_skill_documents_automatic_review_levels():
-    from plugins.study_os.learning import STUDY_ACTIVITY_SCHEMA
-
     review = Path("plugins/study_os/skills/study-review/SKILL.md").read_text(encoding="utf-8")
-    properties = STUDY_ACTIVITY_SCHEMA["parameters"]["properties"]["data"]["properties"]
 
-    assert "self_confidence" not in properties
-    assert "new_review_level" not in properties
     assert "Do not ask for confidence or a review level" in review
     assert "incorrect → Lv.1" in review
     assert "partial → Lv.2" in review
     assert "correct → at least Lv.3" in review
+
+
+def test_study_review_guide_exposes_atomic_submission_fields(vault: Path):
+    assert _init_project(vault, "general-2027", "general.v1")["ok"] is True
+    context = _load_prompt_context(vault, "general-2027", intent="reviewing")
+    submit = next(
+        operation
+        for operation in context["data"]["operation_guide"]
+        if operation.get("operation") == "review.submit"
+    )
+
+    assert submit["data_fields"][:4] == [
+        "note",
+        "response",
+        "result",
+        "duration_seconds",
+    ]
+    assert {"hints_used?", "evaluator?", "assistance?", "diagnoses?"} <= set(
+        submit["data_fields"]
+    )
+
+
+def test_study_review_skill_keeps_multistep_answers_open_until_completion():
+    review = Path("plugins/study_os/skills/study-review/SKILL.md").read_text(encoding="utf-8")
+    contract = " ".join(review.split())
+
+    assert "one coherent retrieval task at a time" in contract
+    assert "learner determine when their response is complete" in contract
+    assert "Completion, correctness, and verification strength" in contract
+    assert "Evaluate the accumulated response against the learning objective" in contract
+    assert "call `review.submit` once" in contract
+    assert "completion action, never a checkpoint action" in contract
+
+
+def test_study_review_stopping_preserves_accumulated_evidence():
+    review = Path("plugins/study_os/skills/study-review/SKILL.md").read_text(encoding="utf-8")
+    contract = " ".join(review.split())
+
+    assert "Stopping closes future work, not prior evidence" in contract
+    assert "not the percentage of requested steps completed" in contract
+    assert "no evaluable response exists" in contract
+    assert "learner explicitly discards it" in contract
+
+
+def test_study_review_skill_submits_clear_complete_answers_without_confirmation():
+    review = Path("plugins/study_os/skills/study-review/SKILL.md").read_text(encoding="utf-8")
+    contract = " ".join(review.split())
+
+    assert "Do not grade before completion" in contract
+    assert "demand another confirmation afterwards" in contract
+    assert "Offer the next item as an option, not an obligation" in contract
+
+
+def test_study_review_and_teaching_preserve_learner_control():
+    skills_root = Path("plugins/study_os/skills")
+    review = (skills_root / "study-review" / "SKILL.md").read_text(encoding="utf-8")
+    teaching = (skills_root / "study-teach" / "SKILL.md").read_text(encoding="utf-8")
+    router = (skills_root / "study-os" / "SKILL.md").read_text(encoding="utf-8")
+
+    for term in ("learner determine", "independent judgments", "Stopping closes future work"):
+        assert term in review
+    for term in ("controls depth, pace, assistance, and stopping", "fixed dialogue pattern", "ready_to_finish"):
+        assert term in teaching
+    assert "never interrupt review or teaching" in router
+    assert "interaction completion" in router.casefold()
+    assert "never continue solely to strengthen" in router
+
+
+def test_study_prompt_fragments_state_principles_without_modality_examples():
+    from plugins.study_os.prompt_budget import extract_prompt_fragment
+
+    skills_root = Path("plugins/study_os/skills")
+    fragments = []
+    for skill_name in ("study-os", "study-review", "study-teach"):
+        text = (skills_root / skill_name / "SKILL.md").read_text(encoding="utf-8")
+        fragment, warning = extract_prompt_fragment(text, source=skill_name)
+        assert warning is None
+        fragments.append(fragment.casefold())
+
+    prompt = "\n".join(fragments)
+    for overfit_example in ("paper", "photo", "self-report", "纸上", "自拍"):
+        assert overfit_example not in prompt
+    assert "interaction completion" in prompt
+    assert "evidence verification" in prompt
+
+
+def test_study_organize_skill_uses_three_layers_and_atomic_save():
+    organize = Path("plugins/study_os/skills/study-organize/SKILL.md").read_text(
+        encoding="utf-8"
+    )
+    contract = " ".join(organize.split())
+
+    for layer in ("**Capture**", "**Synthesize**", "**Curate**"):
+        assert layer in organize
+    assert "requested outcome, scope, and reversibility" in organize
+    assert "request for a persisted note authorizes that scoped write" in contract.casefold()
+    assert "`note.save` validates links and saves atomically" in contract
+    assert "reserve `note.validate` for previews or higher-risk batches" in contract
+
+
+def test_atomic_review_submission_does_not_share_learning_session_evidence_ownership():
+    from plugins.study_os.learning import STUDY_ACTIVITY_SCHEMA
+
+    router = Path("plugins/study_os/skills/study-os/SKILL.md").read_text(encoding="utf-8")
+    review = Path("plugins/study_os/skills/study-review/SKILL.md").read_text(encoding="utf-8")
+    activity_contract = str(STUDY_ACTIVITY_SCHEMA["description"])
+
+    assert "Use one evidence owner" in router
+    assert "review.submit owns both evidence and spacing" in activity_contract
+    assert "start or advance a Learning\nSession" in review
 
 
 def test_study_toolset_is_opt_in():
@@ -2048,106 +2243,99 @@ def test_study_toolset_is_opt_in():
         assert tool not in _HERMES_CORE_TOOLS
 
 
-def test_study_tool_schemas_expose_the_runtime_diagnosis_contract():
+def test_study_model_interface_keeps_action_payloads_behind_prompt_disclosure():
     from plugins.study_os.learning import STUDY_ACTIVITY_SCHEMA, STUDY_COACH_SCHEMA
 
-    activity_diagnoses = STUDY_ACTIVITY_SCHEMA["parameters"]["properties"]["data"]["properties"]["diagnoses"]
-    coach_diagnoses = (
-        STUDY_COACH_SCHEMA["parameters"]["properties"]["data"]["properties"]["observation"]["properties"][
-            "diagnoses"
-        ]
+    for schema in (STUDY_ACTIVITY_SCHEMA, STUDY_COACH_SCHEMA):
+        data_schema = schema["parameters"]["properties"]["data"]
+        assert set(data_schema) == {"type", "description"}
+        assert data_schema["type"] == "object"
+    assert "operation guide" in STUDY_ACTIVITY_SCHEMA["description"]
+    assert "workflow guide" in STUDY_COACH_SCHEMA["description"]
+
+
+def test_study_operation_guides_disclose_diagnosis_fields(vault: Path):
+    assert _init_project(vault, "general-2027", "general.v1")["ok"] is True
+    assessment = _load_prompt_context(vault, "general-2027", intent="assessment")
+    teaching = _load_prompt_context(vault, "general-2027", intent="teaching")
+
+    guide = json.dumps(
+        assessment["data"]["operation_guide"] + teaching["data"]["operation_guide"],
+        ensure_ascii=False,
+    )
+    assert "diagnoses?" in guide
+    assert "observation{response,result,evaluator" in guide
+
+
+def test_study_review_guide_exposes_queue_selectors(vault: Path):
+    assert _init_project(vault, "general-2027", "general.v1")["ok"] is True
+    context = _load_prompt_context(vault, "general-2027", intent="reviewing")
+    due = next(
+        operation
+        for operation in context["data"]["operation_guide"]
+        if operation.get("operation") == "review.due"
     )
 
-    for diagnoses in (activity_diagnoses, coach_diagnoses):
-        assert diagnoses["type"] == "array"
-        assert diagnoses["items"]["type"] == "object"
-        assert set(diagnoses["items"]["required"]) == {"kind", "evidence"}
-        assert diagnoses["items"]["properties"]["kind"]["type"] == "string"
-        assert diagnoses["items"]["properties"]["kind"]["minLength"] == 1
-        assert diagnoses["items"]["properties"]["evidence"]["type"] == "string"
-        assert diagnoses["items"]["properties"]["evidence"]["minLength"] == 1
-
-    assert "Long-term date ranges belong in phases" in STUDY_ACTIVITY_SCHEMA["description"]
-
-
-def test_study_activity_schema_exposes_review_queue_selectors():
-    from plugins.study_os.learning import STUDY_ACTIVITY_SCHEMA
-    from plugins.study_os.tools import STUDY_DUE_REVIEWS_SCHEMA
-
-    activity_data = STUDY_ACTIVITY_SCHEMA["parameters"]["properties"]["data"]["properties"]
-    review_parameters = STUDY_DUE_REVIEWS_SCHEMA["parameters"]["properties"]
-    expected = {
-        name: schema
-        for name, schema in review_parameters.items()
-        if name not in {"vault_path", "notes"}
-    }
-
-    assert {name: activity_data[name] for name in expected} == expected
-    note_variants = activity_data["notes"]["items"]["oneOf"]
-    assert review_parameters["notes"]["items"] in note_variants
+    assert {
+        "notes?",
+        "subjects?",
+        "tags?",
+        "concepts?",
+        "difficulties?",
+        "review_levels?",
+        "review_state?",
+        "match?",
+        "sort?",
+        "limit?",
+        "exclude_paths?",
+    } == set(due["data_fields"])
 
 
-def test_study_activity_schema_and_skills_require_closed_wikilink_saves():
+def test_study_organizing_guide_and_backend_own_closed_wikilink_saves(vault: Path):
     from plugins.study_os.learning import STUDY_ACTIVITY_SCHEMA
 
     description = STUDY_ACTIVITY_SCHEMA["description"]
-    actions = STUDY_ACTIVITY_SCHEMA["parameters"]["properties"]["action"][
-        "description"
-    ]
-    note_items = STUDY_ACTIVITY_SCHEMA["parameters"]["properties"]["data"][
-        "properties"
-    ]["notes"]["items"]["oneOf"]
     router = Path("plugins/study_os/skills/study-os/SKILL.md").read_text(
         encoding="utf-8"
     )
     organize = Path(
         "plugins/study_os/skills/study-organize/SKILL.md"
     ).read_text(encoding="utf-8")
+    assert _init_project(vault, "general-2027", "general.v1")["ok"] is True
+    context = _load_prompt_context(vault, "general-2027", intent="organizing")
+    guide = json.dumps(context["data"]["operation_guide"], ensure_ascii=False)
 
-    assert "note.validate then note.save" in description
-    assert "note.list/read/extract/audit/graph/validate/save" in actions
-    assert any(
-        variant.get("required") == ["path", "content"] for variant in note_items
-    )
+    assert "Canonical save actions validate before writing" in description
+    assert "note.save|validate" in guide
+    assert "notes[{path,content,overwrite?}]" in guide
     assert "never use generic writes" in router.casefold()
     assert "Never use a generic file-writing tool" in organize
 
 
-def test_study_coach_schema_exposes_lifecycle_requirements_before_dispatch():
-    jsonschema = pytest.importorskip("jsonschema")
+def test_study_coach_backend_validates_lifecycle_payload_after_disclosure(vault: Path):
+    from plugins.study_os.learning import handle_study_coach
 
-    from plugins.study_os.contract_models import EVIDENCE_DIMENSIONS, SCHEDULE_ID_PATTERN
-    from plugins.study_os.learning import STUDY_COACH_SCHEMA
-    from plugins.study_os.schemas import ASSISTANCE_LEVELS, EVALUATOR_KINDS, LEARNING_MODES
+    assert _init_project(vault, "general-2027", "general.v1")["ok"] is True
+    rejected = _loads(
+        handle_study_coach(
+            {
+                "action": "start",
+                "vault_path": str(vault),
+                "project_id": "general-2027",
+                "data": {
+                    "session_id": "invalid-contract-001",
+                    "contract": {
+                        "objective": "Translate distance conditions into surface equations.",
+                    },
+                },
+            }
+        )
+    )
 
-    data_properties = STUDY_COACH_SCHEMA["parameters"]["properties"]["data"]["properties"]
-    contract_schema = data_properties["contract"]
-    contract_properties = contract_schema["properties"]
-    observation_schema = data_properties["observation"]
-
-    assert data_properties["session_id"]["pattern"] == SCHEDULE_ID_PATTERN
-    assert set(contract_schema["required"]) == {
-        "mode",
-        "objective",
-        "time_budget_minutes",
-        "assistance_level",
-        "evidence_targets",
-    }
-    assert set(contract_properties["mode"]["enum"]) == LEARNING_MODES
-    assert set(contract_properties["assistance_level"]["enum"]) == ASSISTANCE_LEVELS
-    assert set(contract_properties["evidence_targets"]["items"]["enum"]) == set(EVIDENCE_DIMENSIONS)
-    assert contract_properties["time_budget_minutes"]["minimum"] == 1
-    assert contract_properties["time_budget_minutes"]["maximum"] == 720
-    assert set(observation_schema["required"]) == {"response", "result", "evaluator"}
-    assert set(observation_schema["properties"]["evaluator"]["properties"]["kind"]["enum"]) == EVALUATOR_KINDS
-
-    observed_bad_contract = {
-        "objective": "Translate distance conditions into surface equations.",
-        "activity_type": "teach-test",
-    }
-    errors = list(jsonschema.Draft7Validator(contract_schema).iter_errors(observed_bad_contract))
-
-    assert len([error for error in errors if error.validator == "required"]) == 4
+    assert rejected["ok"] is False
+    assert rejected["error"]["code"] == "VALIDATION_FAILED"
+    for field in ("mode", "time_budget_minutes", "assistance_level", "evidence_targets"):
+        assert field in rejected["error"]["message"]
 
 
 def test_study_activity_diagnosis_error_explains_how_to_retry(vault: Path):
@@ -2538,6 +2726,72 @@ def test_learning_runtime_runs_one_evidence_backed_session(vault: Path):
     assert "explanation" in finished["data"]["outcome"]["unverified_dimensions"]
 
 
+def test_learning_runtime_stops_adding_activities_at_the_time_budget(vault: Path):
+    from plugins.study_os.learning import handle_study_activity, handle_study_coach
+
+    initialized = _loads(
+        handle_study_activity(
+            {
+                "resource": "project",
+                "action": "init",
+                "vault_path": str(vault),
+                "data": {"project_id": "calculus-2027"},
+            }
+        )
+    )
+    started = _loads(
+        handle_study_coach(
+            {
+                "action": "start",
+                "vault_path": str(vault),
+                "project_id": "calculus-2027",
+                "data": {
+                    "session_id": "learn-budget-001",
+                    "contract": {
+                        "mode": "learn",
+                        "objective": "Explain and apply the derivative definition.",
+                        "time_budget_minutes": 1,
+                        "assistance_level": "guided",
+                        "evidence_targets": ["explanation", "near_transfer"],
+                    },
+                },
+            }
+        )
+    )
+    advanced = _loads(
+        handle_study_coach(
+            {
+                "action": "advance",
+                "vault_path": str(vault),
+                "project_id": "calculus-2027",
+                "data": {
+                    "session_id": "learn-budget-001",
+                    "observation": {
+                        "response": "The derivative is the limit of the difference quotient.",
+                        "result": "correct",
+                        "duration_seconds": 60,
+                        "evaluator": {"kind": "agent", "confidence": 0.8},
+                    },
+                },
+            }
+        )
+    )
+
+    assert initialized["ok"] is True
+    assert started["ok"] is True
+    assert advanced["ok"] is True
+    assert advanced["data"]["next_activity"] is None
+    assert advanced["data"]["continuation"] == {
+        "state": "ready_to_finish",
+        "reason": "time_budget_reached",
+        "observed_evidence_targets": ["explanation"],
+        "pending_evidence_targets": ["near_transfer"],
+        "elapsed_activity_seconds": 60,
+        "time_budget_seconds": 60,
+        "learner_controls_follow_up": True,
+    }
+
+
 def test_learning_runtime_rejects_unprovenanced_or_post_finish_evidence(vault: Path):
     from plugins.study_os.learning import handle_study_activity, handle_study_coach
 
@@ -2725,9 +2979,10 @@ def test_engineering_adapter_requires_reproducible_artifacts_for_execution(vault
         "file:run_agent.py",
     ]
     assert advanced["data"]["evidence"]["source_anchors"] == activity["source_anchors"]
-    assert advanced["data"]["next_activity"]["evidence_target"] == "execution"
-    assert advanced["data"]["next_activity"]["assistance_level"] == "independent"
-    assert "not independently verified" in advanced["data"]["next_activity"]["reason"]
+    assert advanced["data"]["next_activity"] is None
+    assert advanced["data"]["continuation"]["state"] == "ready_to_finish"
+    assert advanced["data"]["continuation"]["reason"] == "contract_evidence_observed"
+    assert advanced["data"]["recommendations"]
 
 
 def test_research_adapter_requires_a_source_anchor_for_claim_evidence(vault: Path):
@@ -2821,6 +3076,39 @@ def test_research_adapter_requires_a_source_anchor_for_claim_evidence(vault: Pat
     # One anchored, unaided success is supporting evidence, not demonstrated
     # independence -- that needs a second showing.
     assert accepted["data"]["competency_snapshot"]["dimensions"]["explanation"]["verification_status"] == "supported"
+    assert accepted["data"]["next_activity"] is None
+    assert accepted["data"]["continuation"]["reason"] == "contract_evidence_observed"
+
+    first_finished = _loads(
+        handle_study_coach(
+            {
+                "action": "finish",
+                "vault_path": str(vault),
+                "project_id": "research-unanchored",
+                "data": {"session_id": "learn-claim-001"},
+            }
+        )
+    )
+    second_started = _loads(
+        handle_study_coach(
+            {
+                "action": "start",
+                "vault_path": str(vault),
+                "project_id": "research-unanchored",
+                "data": {
+                    "session_id": "learn-claim-002",
+                    "contract": {
+                        "mode": "research",
+                        "objective": "Re-check the routing claim after spacing.",
+                        "objective_ids": ["explain-routing-claim"],
+                        "time_budget_minutes": 30,
+                        "assistance_level": "independent",
+                        "evidence_targets": ["explanation"],
+                    },
+                },
+            }
+        )
+    )
 
     confirmed = _loads(
         handle_study_coach(
@@ -2829,7 +3117,7 @@ def test_research_adapter_requires_a_source_anchor_for_claim_evidence(vault: Pat
                 "vault_path": str(vault),
                 "project_id": "research-unanchored",
                 "data": {
-                    "session_id": "learn-claim-001",
+                    "session_id": "learn-claim-002",
                     "observation": {
                         "response": "Section 5's ablation isolates latency and reproduces the effect without load.",
                         "result": "correct",
@@ -2842,8 +3130,11 @@ def test_research_adapter_requires_a_source_anchor_for_claim_evidence(vault: Pat
             }
         )
     )
+    assert first_finished["ok"] is True
+    assert second_started["ok"] is True
     assert confirmed["ok"] is True
     assert confirmed["data"]["competency_snapshot"]["dimensions"]["explanation"]["verification_status"] == "independent"
+    assert confirmed["data"]["next_activity"] is None
 
     finished = _loads(
         handle_study_coach(
@@ -2851,7 +3142,7 @@ def test_research_adapter_requires_a_source_anchor_for_claim_evidence(vault: Pat
                 "action": "finish",
                 "vault_path": str(vault),
                 "project_id": "research-unanchored",
-                "data": {"session_id": "learn-claim-001"},
+                "data": {"session_id": "learn-claim-002"},
             }
         )
     )
@@ -2905,6 +3196,9 @@ def test_active_learning_context_is_turn_local_bounded_and_removed_on_finish(vau
     assert "Explain the derivative from its definition." in active["context"]
     assert '"assistance_level":"hints_only"' in active["context"]
     assert "not proof of mastery" in active["context"]
+    assert "Interaction completion and evidence verification are separate" in active["context"]
+    assert "without erasing supported observations already produced" in active["context"]
+    assert "paper" not in active["context"].casefold()
     assert len(active["context"]) <= MAX_ACTIVE_CONTEXT_CHARS
 
     finished = _loads(

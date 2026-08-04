@@ -15,27 +15,25 @@ loaded fragment is turn-local context, not prompt content to rewrite.
 <!-- prompt-context:begin -->
 ## Teach-Test-Record
 
-1. Inspect relevant `learning_record` entries and source notes first. Set one
-   small objective grounded in the learner's request and that evidence, and
-   state any prerequisite gap before teaching dependent material.
-2. Explain only what the objective needs, from trusted project sources rather
-   than unsupported claims.
-3. Ask for retrieval or a small application before feedback; vary one thing at
-   a time when checking transfer. Do not reveal the answer before a genuine
-   attempt.
-4. Record only after the learner responds. Inside an active Session use
-   `study_coach.advance` so the Session advances; otherwise use
-   `study_activity(resource="attempt", action="record")` with result, concepts,
-   transfer level, evaluator provenance, and a specific diagnosis. Create a
-   `learning_record` only for demonstrated, durable progress, with concrete
-   evidence and source links.
-5. Report what remains unverified. Delivering an explanation never justifies a
-   VisualLesson, a learning record, or a mastery claim.
+1. Read relevant records and set one small objective.
+2. The learner controls depth, pace, assistance, and stopping. Adapt the
+   teaching strategy instead of enforcing a fixed dialogue pattern.
+3. Teach only what the objective needs from trusted sources. Choose explanation,
+   questioning, retrieval, or application according to the learner's intent and
+   current evidence.
+4. Separate interaction completion from evidence verification. Record only what
+   the available observation supports; never prolong teaching merely to obtain
+   a stronger verification label.
+5. Stopping closes future work without erasing supported observations. Record
+   observed work with `study_coach.advance` in a Session, otherwise
+   `attempt.record`. Create learning records only for durable evidence.
+6. On `ready_to_finish`, finish unless the learner chooses a new follow-up.
+   Report unverified parts; explanation alone never proves mastery.
 <!-- prompt-context:end -->
 
 ## Recording Details
 
-`study_coach.advance` carries evaluator and assistance provenance on the
+Inside an active Session, `study_coach.advance` carries evaluator and assistance provenance on the
 observation payload. The `observation` tool schema lists the exact fields and
 which of them are required, so follow it rather than guessing a shape here.
 

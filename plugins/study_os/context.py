@@ -92,17 +92,19 @@ def _context_payload(session: dict[str, Any], *, include_details: bool = True) -
     contract: dict[str, Any] = contract_value if isinstance(contract_value, dict) else {}
     activity_value = session.get("current_activity")
     activity: dict[str, Any] = activity_value if isinstance(activity_value, dict) else {}
-    current_activity: dict[str, Any] = {
-        "activity_id": activity.get("activity_id"),
-        "activity_adapter": activity.get("activity_adapter"),
+    current_activity: dict[str, Any] | None = None
+    if activity:
+        current_activity = {
+            "activity_id": activity.get("activity_id"),
+            "activity_adapter": activity.get("activity_adapter"),
             "kind": activity.get("kind"),
             "evidence_target": activity.get("evidence_target"),
             "assistance_level": activity.get("assistance_level"),
-        "evidence_requirements": list(activity.get("evidence_requirements", [])),
-        "instructions": _clip(activity.get("instructions"), 600),
-        "response_policy": _clip(activity.get("response_policy"), 300),
-        "reason": _clip(activity.get("reason"), 350),
-    }
+            "evidence_requirements": list(activity.get("evidence_requirements", [])),
+            "instructions": _clip(activity.get("instructions"), 600),
+            "response_policy": _clip(activity.get("response_policy"), 300),
+            "reason": _clip(activity.get("reason"), 350),
+        }
     payload: dict[str, Any] = {
         "session_id": session.get("session_id"),
         "project_id": session.get("project_id"),
@@ -113,8 +115,12 @@ def _context_payload(session: dict[str, Any], *, include_details: bool = True) -
         "required_evidence": list(contract.get("evidence_targets", [])),
         "recorded_evidence_ids": list(session.get("evidence_ids", []))[-20:],
         "current_activity": current_activity,
+        "continuation": {
+            "state": "continue" if current_activity is not None else "ready_to_finish",
+            "learner_controls_follow_up": True,
+        },
     }
-    if include_details:
+    if include_details and current_activity is not None:
         current_activity["rubric_requirements"] = [
             _clip(item, 140) for item in activity.get("rubric_requirements", [])[:4]
         ]
@@ -134,7 +140,10 @@ def _render_context(session: dict[str, Any]) -> str:
     prefix = (
         "[StudyOS active learning session — turn-local context]\n"
         "This is workflow state, not proof of mastery. Follow the assistance level, collect the learner's "
-        "own response before feedback, and record evaluated evidence with study_coach.advance.\n"
+        "own response before feedback, and record evaluated evidence with study_coach.advance. The learner "
+        "controls scope, pace, and stopping. Interaction completion and evidence verification are separate; "
+        "never prolong the interaction solely to strengthen verification. Stopping closes future work "
+        "without erasing supported observations already produced.\n"
     )
     context = prefix + json.dumps(_context_payload(session), ensure_ascii=False, separators=(",", ":"))
     if len(context) > MAX_ACTIVE_CONTEXT_CHARS:

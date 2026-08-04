@@ -15,11 +15,7 @@ from typing import Any, Callable
 from uuid import uuid4
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
-from plugins.study_os.contract_models import (
-    SCHEDULE_ID_PATTERN,
-    SOURCE_ANCHOR_KINDS,
-    study_project_id_json_schema,
-)
+from plugins.study_os.contract_models import study_project_id_json_schema
 from plugins.study_os.activities import activity_adapter_for
 from plugins.study_os import tools as legacy
 from plugins.study_os.adherence import DEFAULT_LOOKBACK_DAYS, build_plan_adherence
@@ -33,15 +29,10 @@ from plugins.study_os.interventions import InterventionOrchestrator, parse_as_of
 from plugins.study_os.outcomes import build_intervention_outcomes
 from plugins.study_os.notes import StudyNoteCatalog
 from plugins.study_os.schemas import (
-    ASSISTANCE_LEVELS,
     ATTEMPT_RESULTS,
     ATTEMPT_SCHEMA_VERSION,
-    DIAGNOSIS_OBJECT_EXAMPLE,
-    DIAGNOSIS_REQUIRED_FIELDS,
     EVIDENCE_DIMENSIONS,
-    EVALUATOR_KINDS,
     INTERVENTION_POLICY_VERSION,
-    LEARNING_MODES,
     PATTERN_PROPOSAL_SCHEMA_VERSION,
     PLAN_PROPOSAL_SCHEMA_VERSION,
     PLAN_PROPOSAL_STATUSES,
@@ -288,7 +279,26 @@ def handle_study_review_submission(args: dict[str, Any], **_kwargs: Any) -> str:
     try:
         vault = legacy.resolve_vault_path(args.get("vault_path"))
         project = _project(vault, args.get("project_id"))
-        note_ref = str(args.get("note") or "").strip()
+        note_refs = [
+            str(value).strip()
+            for value in (args.get("note"), args.get("path"), args.get("item_id"))
+            if str(value or "").strip()
+        ]
+        notes = args.get("notes")
+        if isinstance(notes, list):
+            note_refs.extend(str(value).strip() for value in notes if str(value).strip())
+        note_refs = list(dict.fromkeys(note_refs))
+        if not note_refs:
+            return legacy._err(
+                "VALIDATION_FAILED",
+                "review.submit requires data.note",
+            )
+        if len(note_refs) != 1:
+            return legacy._err(
+                "VALIDATION_FAILED",
+                "review.submit accepts exactly one reviewed note",
+            )
+        note_ref = note_refs[0]
         note_path, matches = legacy._find_note(vault, note_ref)
         if matches:
             return legacy._err("NOTE_AMBIGUOUS", f"More than one note matched {note_ref!r}")
@@ -1635,213 +1645,13 @@ def handle_study_coach(args: dict[str, Any], **_kwargs: Any) -> str:
         return legacy._err("STUDY_COACH_FAILED", str(exc))
 
 
-def _diagnoses_tool_schema() -> dict[str, Any]:
-    """Return an independent model-facing schema for evidence diagnoses."""
-
-    return {
-        "type": "array",
-        "description": (
-            "Observed diagnoses. Use [] when no specific diagnosis is supported. "
-            "Every non-empty item must be an object, never a string. "
-            f"Example: [{DIAGNOSIS_OBJECT_EXAMPLE}]"
-        ),
-        "items": {
-            "type": "object",
-            "properties": {
-                "kind": {
-                    "type": "string",
-                    "minLength": 1,
-                    "description": "Short, stable diagnosis category such as condition_missed or concept_confusion.",
-                },
-                "evidence": {
-                    "type": "string",
-                    "minLength": 1,
-                    "description": "Specific observed response or reasoning that supports this diagnosis.",
-                },
-                "concept": {
-                    "type": "string",
-                    "description": "Optional concept most directly implicated by the evidence.",
-                },
-            },
-            "required": list(DIAGNOSIS_REQUIRED_FIELDS),
-        },
-    }
-
-
-def _learning_contract_tool_schema() -> dict[str, Any]:
-    """Return the model-facing shape required to start a learning Session."""
-
-    return {
-        "type": "object",
-        "description": (
-            "Required for start. The runtime supplies schema_version, contract_id, project_id, and created_at."
-        ),
-        "properties": {
-            "mode": {
-                "type": "string",
-                "enum": sorted(LEARNING_MODES),
-                "description": "Learning intent: learn, assess, execute, or research.",
-            },
-            "objective": {
-                "type": "string",
-                "minLength": 1,
-                "description": "One observable capability for this Session.",
-            },
-            "objective_ids": {
-                "type": "array",
-                "description": "Optional Objective ids from the active Learning Project.",
-                "items": {"type": "string", "minLength": 1},
-            },
-            "time_budget_minutes": {
-                "type": "integer",
-                "minimum": 1,
-                "maximum": 720,
-            },
-            "assistance_level": {
-                "type": "string",
-                "enum": sorted(ASSISTANCE_LEVELS),
-                "description": "Allowed help: direct, guided, hints_only, or independent.",
-            },
-            "evidence_targets": {
-                "type": "array",
-                "minItems": 1,
-                "uniqueItems": True,
-                "description": "Evidence dimensions the Session must try to observe.",
-                "items": {
-                    "type": "string",
-                    "enum": list(EVIDENCE_DIMENSION_ORDER),
-                },
-            },
-        },
-        "required": [
-            "mode",
-            "objective",
-            "time_budget_minutes",
-            "assistance_level",
-            "evidence_targets",
-        ],
-    }
-
-
-def _source_anchors_tool_schema() -> dict[str, Any]:
-    return {
-        "type": "array",
-        "items": {
-            "type": "object",
-            "properties": {
-                "kind": {"type": "string", "enum": list(SOURCE_ANCHOR_KINDS)},
-                "ref": {"type": "string", "minLength": 1},
-                "version": {"type": "string", "minLength": 1},
-                "locator": {"type": "string", "minLength": 1},
-            },
-            "required": ["kind", "ref"],
-        },
-    }
-
-
-def _evaluated_observation_tool_schema() -> dict[str, Any]:
-    """Return evidence and provenance fields required to advance a Session."""
-
-    return {
-        "type": "object",
-        "description": (
-            "Required for advance. Record only an observed learner response; applied engineering or research "
-            "Activities may also require source_anchors and artifact_refs."
-        ),
-        "properties": {
-            "attempt_id": {"type": "string", "minLength": 1},
-            "response": {"type": "string", "minLength": 1},
-            "result": {"type": "string", "enum": sorted(ATTEMPT_RESULTS)},
-            "score": {"type": "number", "minimum": 0, "maximum": 1},
-            "duration_seconds": {"type": "integer", "minimum": 0},
-            "evaluator": {
-                "type": "object",
-                "description": "Who evaluated the response and with what confidence.",
-                "properties": {
-                    "kind": {"type": "string", "enum": sorted(EVALUATOR_KINDS)},
-                    "id": {"type": "string", "minLength": 1},
-                    "confidence": {"type": "number", "minimum": 0, "maximum": 1},
-                },
-                "required": ["kind"],
-            },
-            "assistance": {
-                "type": "object",
-                "description": "Optional actual assistance used; defaults to the current Activity.",
-                "properties": {
-                    "level": {"type": "string", "enum": sorted(ASSISTANCE_LEVELS)},
-                    "hints_used": {"type": "integer", "minimum": 0},
-                },
-            },
-            "concepts": {
-                "type": "array",
-                "items": {"type": "string", "minLength": 1},
-            },
-            "patterns": {
-                "type": "array",
-                "items": {"type": "string", "minLength": 1},
-            },
-            "diagnoses": _diagnoses_tool_schema(),
-            "source_anchors": _source_anchors_tool_schema(),
-            "artifact_refs": {
-                "type": "array",
-                "items": {"type": "string", "minLength": 1},
-            },
-        },
-        "required": ["response", "result", "evaluator"],
-    }
-
-
-def _review_due_tool_properties() -> dict[str, Any]:
-    """Reuse the canonical review queue selectors on the consolidated tool."""
-
-    return {
-        name: schema
-        for name, schema in legacy.STUDY_DUE_REVIEWS_SCHEMA["parameters"]["properties"].items()
-        if name != "vault_path"
-    }
-
-
-def _note_batch_tool_schema() -> dict[str, Any]:
-    return {
-        "type": "array",
-        "description": (
-            "For note.validate/save, the complete recursive batch of notes. "
-            "Every WikiLink reachable from these notes must resolve to an "
-            "existing Vault note/attachment or another note in this batch."
-        ),
-        "items": {
-            "oneOf": [
-                dict(
-                    legacy.STUDY_DUE_REVIEWS_SCHEMA["parameters"]["properties"][
-                        "notes"
-                    ]["items"]
-                ),
-                {
-                    "type": "object",
-                    "properties": {
-                        "path": {
-                            "type": "string",
-                            "description": "Vault-relative Markdown path.",
-                        },
-                        "content": {
-                            "type": "string",
-                            "description": "Complete non-empty Markdown content.",
-                        },
-                        "overwrite": {
-                            "type": "boolean",
-                            "description": "Allow this item to replace an existing note.",
-                        },
-                    },
-                    "required": ["path", "content"],
-                    "additionalProperties": False,
-                },
-            ]
-        },
-    }
-
-
 STUDY_ACTIVITY_SCHEMA = {
-    "description": "Single StudyOS persistence interface. For a StudyOS learning-planning request, first call project.status and prompt_context.load with planning or schedule_adjustment. Creating, completing, updating, registering, or adding a StudyOS plan requires schedule.validate followed by schedule.save; a Markdown file is only a draft and never completes persistence. Obsidian note writes must use note.validate then note.save, never a generic file-write tool: save is atomic and rejects every direct or transitively reachable dangling WikiLink until substantive notes for all missing targets are included in the batch. note.audit/graph reports existing WikiLink integrity; concept.graph remains the learning-dependency graph. Record/query immutable attempts and manage projects, notes, reviews, concepts, curricula, schedules, records, lessons, evidence-backed pattern proposals, and proactive Plan Proposals. For schedule.validate/save, data is the complete study_schedule.v1 object itself. Long-term date ranges belong in phases; phase.effort_minutes may hold aggregate workload, while events are optional concrete sessions and may be empty. schedule.save validates and writes the canonical file discovered by the StudyOS panel, so do not write or register a Schedule separately. plan_proposal supports ensure_today/save/list/read/accept/reject/apply; ensure_today derives and persists the day's plan once and returns the existing one afterwards, accept records a decision without mutating a Schedule, and apply then writes an accepted plan's events -- and only its events -- into their Schedules. Cron sessions may save proposals but cannot decide them or save Schedules. For review.due, data supports explicit notes, subjects, YAML tags, concepts, difficulties, levels, review_state, match, sort, limit, and exclude_paths selectors; hidden directories are excluded by default, and limit never broadens the selectors. For a graded interactive review, prefer review.submit: it atomically stores the immutable attempt and advances spaced repetition. Put operation parameters in data.",
+    "description": (
+        "StudyOS state interface. Start a workflow with project.status, then "
+        "prompt_context.load(intent) for its operation guide. Select an operation "
+        "with resource and action; put its payload in data. Canonical save actions "
+        "validate before writing. review.submit owns both evidence and spacing."
+    ),
     "parameters": {
         "type": "object",
         "properties": {
@@ -1849,26 +1659,15 @@ STUDY_ACTIVITY_SCHEMA = {
                 "type": "string",
                 "enum": ["attempt", "pattern_proposal", "plan_proposal", "project", "schedule", "note", "review", "error", "concept", "curriculum", "learning_record", "decision", "lesson", "prompt_context", "session", "memory"],
             },
-            "action": {"type": "string", "description": "Resource action, e.g. attempt.record/list/read, note.list/read/extract/audit/graph/validate/save, schedule.template/validate/save/list/read, review.due/submit/stats, concept.graph/queue/update_state, or project.init/status."},
+            "action": {
+                "type": "string",
+                "description": "Action from the loaded operation guide.",
+            },
             "vault_path": {"type": "string"},
             "project_id": study_project_id_json_schema(),
             "data": {
                 "type": "object",
-                "description": "Payload for the selected resource action. For schedule.validate/save, put the complete Schedule directly here: data={schema_version, schedule_id, project_id, ...}. Use phases (optionally phase.effort_minutes) for long-term ranges and events only for concrete sessions. Do not nest it under data.schedule or a second data.",
-                "properties": {
-                    **_review_due_tool_properties(),
-                    "notes": _note_batch_tool_schema(),
-                    "roots": {
-                        "type": "array",
-                        "items": {"type": "string"},
-                        "description": "Optional note roots for note.audit/graph; omitted audits the full Vault.",
-                    },
-                    "overwrite": {
-                        "type": "boolean",
-                        "description": "Allow note.save/validate to replace existing batch paths.",
-                    },
-                    "diagnoses": _diagnoses_tool_schema(),
-                },
+                "description": "Operation payload from the loaded guide or returned template.",
             },
         },
         "required": ["resource", "action"],
@@ -1877,50 +1676,26 @@ STUDY_ACTIVITY_SCHEMA = {
 
 
 STUDY_COACH_SCHEMA = {
-    "description": "Evidence-driven StudyOS learning runtime and coach. Start, advance, inspect, or finish an explicit learning Session; diagnose attempts; summarize demonstrated change; recommend an intervention; prioritize a project-wide Intervention Queue; produce a read-only plan proposal; evaluate whether accepted Interventions were followed by improvement; evaluate whether applied day-plan events actually happened; generate a diagnostic-probe blueprint; or propose a versioned problem-pattern improvement. prioritize and propose_plan already apply what those two evaluations measure -- observed activity duration, measured effectiveness, and completed share of a planned day -- so call evaluate_adherence or evaluate_interventions to explain a plan, not to obtain one. Starting never creates evidence, advancing requires evaluator provenance, and proactive actions never persist or mutate a Schedule.",
+    "description": (
+        "StudyOS evidence projection and Session runtime. Load the workflow guide "
+        "before use. start creates no evidence; advance requires an evaluated "
+        "observation and returns continuation; finish may leave dimensions "
+        "unverified. Analysis and proposal actions do not mutate Schedules."
+    ),
     "parameters": {
         "type": "object",
         "properties": {
             "action": {
                 "type": "string",
                 "enum": ["start", "advance", "snapshot", "finish", "diagnose", "summarize", "recommend", "prioritize", "propose_plan", "evaluate_interventions", "evaluate_adherence", "generate_probe", "propose_pattern"],
-                "description": (
-                    "start requires data.session_id and data.contract; advance requires data.session_id and "
-                    "data.observation; snapshot/finish require data.session_id."
-                ),
+                "description": "Action from the loaded operation guide.",
             },
             "scope": {"type": "string", "enum": ["session", "concept", "week", "project"]},
             "vault_path": {"type": "string"},
             "project_id": study_project_id_json_schema(),
             "data": {
                 "type": "object",
-                "description": "For lifecycle actions: session_id plus contract (start) or evaluated observation (advance). For evidence analysis: concept, pattern, item_id, result, start_date, or end_date filters. For prioritize/propose_plan: optional timezone-aware as_of and max_items (1-20). For evaluate_adherence: optional start_date/end_date bounding which applied days are reconciled, defaulting to the last two weeks.",
-                "properties": {
-                    "session_id": {
-                        "type": "string",
-                        "pattern": SCHEDULE_ID_PATTERN,
-                        "description": "Required for start, advance, snapshot, and finish.",
-                    },
-                    "conversation_session_id": {
-                        "type": "string",
-                        "minLength": 1,
-                        "description": "Optional explicit Hermes conversation binding for start.",
-                    },
-                    "contract": _learning_contract_tool_schema(),
-                    "observation": _evaluated_observation_tool_schema(),
-                    "concept": {"type": "string", "minLength": 1},
-                    "pattern": {"type": "string", "minLength": 1},
-                    "item_id": {"type": "string", "minLength": 1},
-                    "result": {"type": "string", "enum": sorted(ATTEMPT_RESULTS)},
-                    "attempt_ids": {
-                        "type": "array",
-                        "items": {"type": "string", "minLength": 1},
-                    },
-                    "start_date": {"type": "string", "description": "Inclusive ISO date YYYY-MM-DD."},
-                    "end_date": {"type": "string", "description": "Inclusive ISO date YYYY-MM-DD."},
-                    "as_of": {"type": "string", "description": "Timezone-aware ISO datetime."},
-                    "max_items": {"type": "integer", "minimum": 1, "maximum": 20},
-                },
+                "description": "Action payload from the loaded operation guide.",
             },
         },
         "required": ["action"],
